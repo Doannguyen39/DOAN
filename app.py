@@ -15,6 +15,9 @@ st.set_page_config(
 )
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+import os
+CG_KEY = os.environ.get("COINGECKO_API_KEY", "")
+CG_HEADERS = {"x-cg-demo-api-key": CG_KEY} if CG_KEY else {}
 
 # ─── CUSTOM CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
@@ -244,7 +247,7 @@ st.markdown("""
 def search_token(query: str):
     """Search token by name/symbol"""
     try:
-        r = requests.get(f"{COINGECKO_BASE}/search", params={"query": query}, timeout=10)
+        r = requests.get(f"{COINGECKO_BASE}/search", params={"query": query}, headers=CG_HEADERS, timeout=10)
         if r.status_code == 200:
             return r.json().get("coins", [])
     except:
@@ -278,7 +281,7 @@ def get_token_data(coin_id: str):
 def get_trending():
     """Get trending coins"""
     try:
-        r = requests.get(f"{COINGECKO_BASE}/search/trending", timeout=10)
+        r = requests.get(f"{COINGECKO_BASE}/search/trending", headers=CG_HEADERS, timeout=10)
         if r.status_code == 200:
             return r.json().get("coins", [])
     except:
