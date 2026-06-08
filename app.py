@@ -308,17 +308,17 @@ def get_new_listings():
             f"{COINGECKO_BASE}/coins/markets",
             params={
                 "vs_currency": "usd",
-                "order": "market_cap_asc",
-                "per_page": 100,
+                "order": "volume_desc",
+                "per_page": 250,
                 "page": 1,
                 "sparkline": "false",
                 "price_change_percentage": "24h",
             },
-            timeout=10
+            headers=CG_HEADERS,
+            timeout=15
         )
         if r2.status_code == 200:
             data = r2.json()
-            # Filter market cap < $5M and has volume
             filtered = [
                 c for c in data
                 if c.get("market_cap") and 100_000 < c["market_cap"] < 5_000_000
