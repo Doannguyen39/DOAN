@@ -105,16 +105,22 @@ def get_token_data(coin_id):
 
 @st.cache_data(ttl=300)
 def get_ohlcv_h4(coin_id):
-    """Lấy OHLCV data H4 từ CoinGecko (dùng daily rồi resample)"""
+    """Lấy price data từ market_chart rồi tạo OHLCV giả lập"""
     try:
-        r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
-            params={"vs_currency": "usd", "days": "90"},
+        r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
+            params={"vs_currency": "usd", "days": "90", "interval": "daily"},
             headers=CG_HEADERS, timeout=15)
         if r.status_code == 200:
             data = r.json()
-            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
+            prices = data.get("prices", [])
+            if len(prices) < 10:
+                return None
+            df = pd.DataFrame(prices, columns=["timestamp", "close"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             df = df.set_index("timestamp")
+            df["open"] = df["close"].shift(1).fillna(df["close"])
+            df["high"] = df[["open","close"]].max(axis=1) * (1 + abs(df["close"].pct_change().fillna(0)) * 0.5)
+            df["low"]  = df[["open","close"]].min(axis=1) * (1 - abs(df["close"].pct_change().fillna(0)) * 0.5)
             return df
     except: pass
     return None
