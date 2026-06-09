@@ -107,17 +107,34 @@ def get_token_data(coin_id):
 
 @st.cache_data(ttl=300)
 def get_ohlcv_h4(coin_id):
-    """Lấy OHLCV data H4 từ CoinGecko (dùng daily rồi resample)"""
+    """Lấy OHLCV data từ CoinGecko, fallback market_chart nếu ohlc fail"""
     try:
+        # Try OHLC endpoint first
         r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
             params={"vs_currency": "usd", "days": "90"},
             headers=CG_HEADERS, timeout=15)
         if r.status_code == 200:
             data = r.json()
-            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df = df.set_index("timestamp")
-            return df
+            if len(data) >= 10:
+                df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                return df.set_index("timestamp")
+    except: pass
+    try:
+        # Fallback: market_chart
+        r2 = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
+            params={"vs_currency": "usd", "days": "90", "interval": "daily"},
+            headers=CG_HEADERS, timeout=15)
+        if r2.status_code == 200:
+            prices = r2.json().get("prices", [])
+            if len(prices) >= 10:
+                df = pd.DataFrame(prices, columns=["timestamp", "close"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                df = df.set_index("timestamp")
+                df["open"] = df["close"].shift(1).fillna(df["close"])
+                df["high"] = df[["open","close"]].max(axis=1) * (1 + abs(df["close"].pct_change().fillna(0)) * 0.5)
+                df["low"]  = df[["open","close"]].min(axis=1) * (1 - abs(df["close"].pct_change().fillna(0)) * 0.5)
+                return df
     except: pass
     return None
 
@@ -503,10 +520,10 @@ def get_top_gainers_cmc():
             gainers = []
             for c in coins:
                 q = c.get("quote", {}).get("USD", {})
-                change_3d = q.get("percent_change_7d", 0) or 0
+                change_3d = q.get("percent_change_72h", 0) or 0
                 mcap = q.get("market_cap", 0) or 0
                 volume = q.get("volume_24h", 0) or 0
-                if change_3d >= 30 and 100_000 < mcap < 5_000_000 and volume > 10_000:
+                if change_3d >= 100 and 100_000 < mcap < 5_000_000 and volume > 10_000:
                     gainers.append({
                         "id": c.get("id"),
                         "name": c.get("name"),
@@ -597,12 +614,12 @@ def get_hidden_gems_by_narrative(narrative_tags):
             gems = []
             for c in coins:
                 q = c.get("quote", {}).get("USD", {})
-                change_3d = q.get("percent_change_7d", 0) or 0
+                change_3d = q.get("percent_change_72h", 0) or 0
                 change_24h = q.get("percent_change_24h", 0) or 0
                 mcap = q.get("market_cap", 0) or 0
                 volume = q.get("volume_24h", 0) or 0
                 # Chưa pump mạnh
-                if change_3d > 80 or change_24h > 50:
+                if change_3d > 50 or change_24h > 30:
                     continue
                 if mcap < 50_000 or volume < 5_000:
                     continue
