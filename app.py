@@ -19,6 +19,8 @@ st.set_page_config(
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 CG_KEY = os.environ.get("COINGECKO_API_KEY", "")
 CG_HEADERS = {"x-cg-demo-api-key": CG_KEY} if CG_KEY else {}
+CMC_KEY = os.environ.get("CMC_API_KEY", "")
+CMC_HEADERS = {"X-CMC_PRO_API_KEY": CMC_KEY, "Accept": "application/json"}
 
 # ─── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -105,22 +107,16 @@ def get_token_data(coin_id):
 
 @st.cache_data(ttl=300)
 def get_ohlcv_h4(coin_id):
-    """Lấy price data từ market_chart rồi tạo OHLCV giả lập"""
+    """Lấy OHLCV data H4 từ CoinGecko (dùng daily rồi resample)"""
     try:
-        r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
-            params={"vs_currency": "usd", "days": "90", "interval": "daily"},
+        r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
+            params={"vs_currency": "usd", "days": "90"},
             headers=CG_HEADERS, timeout=15)
         if r.status_code == 200:
             data = r.json()
-            prices = data.get("prices", [])
-            if len(prices) < 10:
-                return None
-            df = pd.DataFrame(prices, columns=["timestamp", "close"])
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             df = df.set_index("timestamp")
-            df["open"] = df["close"].shift(1).fillna(df["close"])
-            df["high"] = df[["open","close"]].max(axis=1) * (1 + abs(df["close"].pct_change().fillna(0)) * 0.5)
-            df["low"]  = df[["open","close"]].min(axis=1) * (1 - abs(df["close"].pct_change().fillna(0)) * 0.5)
             return df
     except: pass
     return None
@@ -481,6 +477,157 @@ def fmt_price(val):
 def pct_color(val): return "#3fb950" if (val or 0)>=0 else "#f85149"
 def pct_str(val): return "N/A" if val is None else f"{'+'if val>=0 else''}{val:.2f}%"
 
+
+CMC_BASE = "https://pro-api.coinmarketcap.com/v1"
+
+@st.cache_data(ttl=1800)
+def get_top_gainers_cmc():
+    """Lấy top 30 token x2+ trong 3 ngày, market cap < $5M"""
+    if not CMC_KEY:
+        return None, "Chưa cấu hình CMC API key"
+    try:
+        r = requests.get(
+            f"{CMC_BASE}/cryptocurrency/listings/latest",
+            headers=CMC_HEADERS,
+            params={
+                "limit": 200,
+                "sort": "percent_change_7d",
+                "sort_dir": "desc",
+                "market_cap_max": 10_000_000,
+                "convert": "USD"
+            },
+            timeout=15
+        )
+        if r.status_code == 200:
+            coins = r.json().get("data", [])
+            gainers = []
+            for c in coins:
+                q = c.get("quote", {}).get("USD", {})
+                change_3d = q.get("percent_change_72h", 0) or 0
+                mcap = q.get("market_cap", 0) or 0
+                volume = q.get("volume_24h", 0) or 0
+                if change_3d >= 100 and 100_000 < mcap < 5_000_000 and volume > 10_000:
+                    gainers.append({
+                        "id": c.get("id"),
+                        "name": c.get("name"),
+                        "symbol": c.get("symbol"),
+                        "slug": c.get("slug"),
+                        "tags": c.get("tags", []),
+                        "price": q.get("price", 0),
+                        "change_24h": q.get("percent_change_24h", 0),
+                        "change_3d": change_3d,
+                        "market_cap": mcap,
+                        "volume": volume,
+                    })
+            return sorted(gainers, key=lambda x: x["change_3d"], reverse=True)[:30], None
+        elif r.status_code == 401:
+            return None, "API key không hợp lệ"
+        else:
+            return None, f"Lỗi API: {r.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+def analyze_narrative(gainers):
+    """Phân tích narrative từ danh sách gainers"""
+    if not gainers:
+        return {}
+    tag_count = {}
+    tag_tokens = {}
+    # Normalize tags
+    narrative_map = {
+        "artificial-intelligence": "🤖 AI / Machine Learning",
+        "ai-big-data": "🤖 AI / Machine Learning",
+        "real-world-assets": "🏦 RWA (Real World Assets)",
+        "rwa": "🏦 RWA (Real World Assets)",
+        "depin": "📡 DePIN",
+        "decentralized-physical-infrastructure": "📡 DePIN",
+        "gaming": "🎮 GameFi",
+        "play-to-earn": "🎮 GameFi",
+        "decentralized-finance-defi": "💰 DeFi",
+        "defi": "💰 DeFi",
+        "layer-2": "⚡ Layer 2",
+        "ethereum-ecosystem": "⚡ Layer 2",
+        "memes": "🐸 Meme",
+        "sports": "⚽ Sports",
+        "nft": "🖼️ NFT",
+        "metaverse": "🌐 Metaverse",
+        "social-fi": "👥 SocialFi",
+        "agent": "🤖 AI / Machine Learning",
+        "ai-agents": "🤖 AI / Machine Learning",
+    }
+    for token in gainers:
+        matched = set()
+        for tag in token.get("tags", []):
+            tag_lower = tag.lower().replace(" ", "-")
+            for key, narrative in narrative_map.items():
+                if key in tag_lower and narrative not in matched:
+                    matched.add(narrative)
+                    tag_count[narrative] = tag_count.get(narrative, 0) + 1
+                    if narrative not in tag_tokens:
+                        tag_tokens[narrative] = []
+                    tag_tokens[narrative].append(token)
+        if not matched:
+            other = "🔮 Other"
+            tag_count[other] = tag_count.get(other, 0) + 1
+            if other not in tag_tokens:
+                tag_tokens[other] = []
+            tag_tokens[other].append(token)
+    return dict(sorted(tag_count.items(), key=lambda x: x[1], reverse=True)), tag_tokens
+
+@st.cache_data(ttl=1800)
+def get_hidden_gems_by_narrative(narrative_tags):
+    """Tìm token chưa pump cùng narrative"""
+    if not CMC_KEY:
+        return []
+    try:
+        r = requests.get(
+            f"{CMC_BASE}/cryptocurrency/listings/latest",
+            headers=CMC_HEADERS,
+            params={
+                "limit": 500,
+                "sort": "volume_24h",
+                "sort_dir": "desc",
+                "market_cap_max": 1_000_000,
+                "convert": "USD"
+            },
+            timeout=15
+        )
+        if r.status_code == 200:
+            coins = r.json().get("data", [])
+            gems = []
+            for c in coins:
+                q = c.get("quote", {}).get("USD", {})
+                change_3d = q.get("percent_change_72h", 0) or 0
+                change_24h = q.get("percent_change_24h", 0) or 0
+                mcap = q.get("market_cap", 0) or 0
+                volume = q.get("volume_24h", 0) or 0
+                # Chưa pump mạnh
+                if change_3d > 50 or change_24h > 30:
+                    continue
+                if mcap < 50_000 or volume < 5_000:
+                    continue
+                # Check narrative match
+                tags = [t.lower() for t in c.get("tags", [])]
+                match = any(nt in " ".join(tags) for nt in narrative_tags)
+                if match:
+                    vol_mcap = volume / mcap if mcap > 0 else 0
+                    gems.append({
+                        "name": c.get("name"),
+                        "symbol": c.get("symbol"),
+                        "tags": c.get("tags", [])[:3],
+                        "price": q.get("price", 0),
+                        "change_24h": change_24h,
+                        "change_3d": change_3d,
+                        "market_cap": mcap,
+                        "volume": volume,
+                        "vol_mcap": vol_mcap,
+                    })
+            # Sort by volume/mcap ratio (accumulation signal)
+            return sorted(gems, key=lambda x: x["vol_mcap"], reverse=True)[:20]
+    except:
+        pass
+    return []
+
 # ─── HEADER ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="main-header">
@@ -649,7 +796,7 @@ if search_btn and query:
 
 # ─── TRENDING & MICROCAP TABS ─────────────────────────────────────────────────
 st.markdown("<br><hr style='border-color:#21262d;'><br>", unsafe_allow_html=True)
-tab1, tab2 = st.tabs(["🔥 Trending hôm nay", "💎 Micro-cap đáng chú ý (<$5M)"])
+tab1, tab2, tab3 = st.tabs(["🔥 Trending hôm nay", "💎 Micro-cap đáng chú ý (<$5M)", "🔍 Narrative Scanner"])
 
 with tab1:
     trending = get_trending()
@@ -693,5 +840,120 @@ with tab2:
             cols[5].markdown(f'<div style="padding-top:10px;font-size:0.9rem;color:#8b949e;">{fmt_usd(coin.get("fully_diluted_valuation",0))}</div>', unsafe_allow_html=True)
     else:
         st.info("Đang tải micro-cap data...")
+
+
+with tab3:
+    st.markdown("""
+    <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:16px 20px;margin-bottom:20px;">
+        <div style="font-size:0.9rem;color:#e6edf3;font-weight:600;">🔍 Narrative Scanner</div>
+        <div style="color:#8b949e;font-size:0.82rem;margin-top:6px;">
+            Tự động phát hiện narrative đang pump → tìm gem chưa pump cùng sector · Cập nhật mỗi 30 phút
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not CMC_KEY:
+        st.error("⚠️ Chưa cấu hình CMC_API_KEY trong Streamlit Secrets.")
+    else:
+        with st.spinner("📊 Đang phân tích top gainers 3 ngày..."):
+            gainers, err = get_top_gainers_cmc()
+
+        if err:
+            st.error(f"Lỗi: {err}")
+        elif not gainers:
+            st.info("Không tìm thấy token nào x2+ trong 3 ngày với market cap < $5M.")
+        else:
+            # Narrative analysis
+            narrative_counts, narrative_tokens = analyze_narrative(gainers)
+
+            # Top narrative banner
+            if narrative_counts:
+                top_narrative = list(narrative_counts.keys())[0]
+                top_count = list(narrative_counts.values())[0]
+                st.markdown(f"""
+                <div style="background:linear-gradient(135deg,#1a2e1a,#0d1117);border:1px solid #3fb950;border-radius:12px;padding:20px;margin-bottom:20px;text-align:center;">
+                    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;">Narrative đang HOT nhất</div>
+                    <div style="font-size:2rem;font-weight:700;color:#3fb950;margin-top:8px;">{top_narrative}</div>
+                    <div style="color:#8b949e;font-size:0.85rem;margin-top:4px;">{top_count} token x2+ trong 3 ngày · {len(gainers)} gainers tổng</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Narrative breakdown
+            st.markdown('<div class="section-title">📊 Phân bổ Narrative trong top gainers</div>', unsafe_allow_html=True)
+            narr_cols = st.columns(min(len(narrative_counts), 4))
+            for i, (narr, count) in enumerate(list(narrative_counts.items())[:4]):
+                pct = count / len(gainers) * 100
+                with narr_cols[i]:
+                    st.markdown(f"""
+                    <div class="score-card">
+                        <div style="font-size:1.5rem;">{narr.split()[0]}</div>
+                        <div style="font-size:1.2rem;font-weight:700;color:#58a6ff;margin-top:4px;">{count} tokens</div>
+                        <div style="color:#8b949e;font-size:0.8rem;">{narr.split(' ',1)[1] if ' ' in narr else narr}</div>
+                        <div style="color:#3fb950;font-size:0.75rem;margin-top:4px;">{pct:.0f}% gainers</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Top gainers table
+            st.markdown('<div class="section-title">🚀 Top 30 token x2+ (3 ngày) · Market cap < $5M</div>', unsafe_allow_html=True)
+            cols_h = st.columns([2, 1.2, 1.2, 1.2, 1.2, 2])
+            for col, h in zip(cols_h, ["Token", "Giá", "3 ngày", "24h", "Market Cap", "Narrative"]):
+                col.markdown(f'<div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
+
+            for token in gainers:
+                cols = st.columns([2, 1.2, 1.2, 1.2, 1.2, 2])
+                cols[0].markdown(f'<div style="padding-top:8px;font-weight:500;">{token["name"]} <span style="color:#8b949e;font-size:0.75rem;">{token["symbol"]}</span></div>', unsafe_allow_html=True)
+                cols[1].markdown(f'<div style="padding-top:8px;font-size:0.9rem;">{fmt_price(token["price"])}</div>', unsafe_allow_html=True)
+                cols[2].markdown(f'<div style="color:#3fb950;padding-top:8px;font-weight:600;">+{token["change_3d"]:.0f}%</div>', unsafe_allow_html=True)
+                cols[3].markdown(f'<div style="color:{pct_color(token["change_24h"])};padding-top:8px;">{pct_str(token["change_24h"])}</div>', unsafe_allow_html=True)
+                cols[4].markdown(f'<div style="padding-top:8px;color:#8b949e;font-size:0.9rem;">{fmt_usd(token["market_cap"])}</div>', unsafe_allow_html=True)
+                tags_html = " ".join([f'<span class="badge badge-purple">{t[:12]}</span>' for t in token["tags"][:2]])
+                cols[5].markdown(f'<div style="padding-top:6px;">{tags_html}</div>', unsafe_allow_html=True)
+
+            # Hidden gems section
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-title">💎 Gem chưa pump — cùng narrative đang hot</div>', unsafe_allow_html=True)
+
+            # Get top narrative tags for searching
+            if narrative_counts:
+                top_narr = list(narrative_counts.keys())[0].lower()
+                narr_tag_map = {
+                    "ai": ["artificial-intelligence", "ai", "agent"],
+                    "rwa": ["real-world-assets", "rwa"],
+                    "depin": ["depin", "infrastructure"],
+                    "gamefi": ["gaming", "play-to-earn", "game"],
+                    "defi": ["defi", "decentralized-finance"],
+                    "meme": ["memes", "meme"],
+                    "sports": ["sports", "fan-token"],
+                }
+                search_tags = ["ai", "agent"]  # default
+                for key, tags in narr_tag_map.items():
+                    if key in top_narr:
+                        search_tags = tags
+                        break
+
+                with st.spinner(f"🔍 Đang scan gem chưa pump trong narrative {list(narrative_counts.keys())[0]}..."):
+                    gems = get_hidden_gems_by_narrative(search_tags)
+
+                if gems:
+                    st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:12px;">Tìm thấy {len(gems)} token tiềm năng · Sắp xếp theo Volume/Mcap ratio (tín hiệu accumulation)</div>', unsafe_allow_html=True)
+                    cols_h2 = st.columns([2, 1.2, 1.2, 1.2, 1.2, 1.2])
+                    for col, h in zip(cols_h2, ["Token", "Giá", "24h", "3 ngày", "Market Cap", "Vol/Mcap"]):
+                        col.markdown(f'<div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
+
+                    for gem in gems:
+                        vol_ratio = gem["vol_mcap"]
+                        vol_signal = "🔥" if vol_ratio > 0.5 else "👀" if vol_ratio > 0.2 else "📊"
+                        cols = st.columns([2, 1.2, 1.2, 1.2, 1.2, 1.2])
+                        cols[0].markdown(f'<div style="padding-top:8px;font-weight:500;">{gem["name"]} <span style="color:#8b949e;font-size:0.75rem;">{gem["symbol"]}</span></div>', unsafe_allow_html=True)
+                        cols[1].markdown(f'<div style="padding-top:8px;font-size:0.9rem;">{fmt_price(gem["price"])}</div>', unsafe_allow_html=True)
+                        cols[2].markdown(f'<div style="color:{pct_color(gem["change_24h"])};padding-top:8px;">{pct_str(gem["change_24h"])}</div>', unsafe_allow_html=True)
+                        cols[3].markdown(f'<div style="color:{pct_color(gem["change_3d"])};padding-top:8px;">{pct_str(gem["change_3d"])}</div>', unsafe_allow_html=True)
+                        cols[4].markdown(f'<div style="padding-top:8px;color:#8b949e;font-size:0.9rem;">{fmt_usd(gem["market_cap"])}</div>', unsafe_allow_html=True)
+                        cols[5].markdown(f'<div style="padding-top:8px;">{vol_signal} {vol_ratio:.2f}x</div>', unsafe_allow_html=True)
+                else:
+                    st.info("Không tìm thấy gem phù hợp. Thử lại sau.")
+
 
 st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.8rem;padding:20px 0;">💎 Hidden Gem Hunter · H4 TA · CoinGecko API · Research only</div>', unsafe_allow_html=True)
