@@ -506,7 +506,7 @@ def get_top_gainers_cmc():
                 change_3d = q.get("percent_change_72h", 0) or 0
                 mcap = q.get("market_cap", 0) or 0
                 volume = q.get("volume_24h", 0) or 0
-                if change_3d >= 100 and 100_000 < mcap < 5_000_000 and volume > 10_000:
+                if change_3d >= 30 and 100_000 < mcap < 5_000_000 and volume > 10_000:
                     gainers.append({
                         "id": c.get("id"),
                         "name": c.get("name"),
@@ -602,7 +602,7 @@ def get_hidden_gems_by_narrative(narrative_tags):
                 mcap = q.get("market_cap", 0) or 0
                 volume = q.get("volume_24h", 0) or 0
                 # Chưa pump mạnh
-                if change_3d > 50 or change_24h > 30:
+                if change_3d > 80 or change_24h > 50:
                     continue
                 if mcap < 50_000 or volume < 5_000:
                     continue
