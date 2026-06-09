@@ -872,6 +872,8 @@ with tab3:
     if not CMC_KEY:
         st.error("⚠️ Chưa cấu hình CMC_API_KEY trong Streamlit Secrets.")
     else:
+        if st.button("🔄 Refresh data"):
+            st.cache_data.clear()
         with st.spinner("📊 Đang phân tích top gainers 3 ngày..."):
             gainers, err = get_top_gainers_cmc()
 
