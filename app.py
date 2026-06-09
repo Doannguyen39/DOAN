@@ -503,7 +503,7 @@ def get_top_gainers_cmc():
             gainers = []
             for c in coins:
                 q = c.get("quote", {}).get("USD", {})
-                change_3d = q.get("percent_change_72h", 0) or 0
+                change_3d = q.get("percent_change_7d", 0) or 0
                 mcap = q.get("market_cap", 0) or 0
                 volume = q.get("volume_24h", 0) or 0
                 if change_3d >= 30 and 100_000 < mcap < 5_000_000 and volume > 10_000:
@@ -597,7 +597,7 @@ def get_hidden_gems_by_narrative(narrative_tags):
             gems = []
             for c in coins:
                 q = c.get("quote", {}).get("USD", {})
-                change_3d = q.get("percent_change_72h", 0) or 0
+                change_3d = q.get("percent_change_7d", 0) or 0
                 change_24h = q.get("percent_change_24h", 0) or 0
                 mcap = q.get("market_cap", 0) or 0
                 volume = q.get("volume_24h", 0) or 0
