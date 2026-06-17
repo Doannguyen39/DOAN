@@ -164,15 +164,32 @@ MEXC_BASE = "https://api.mexc.com/api/v3"
 
 @st.cache_data(ttl=300)
 def get_mexc_usdt_pairs():
-    """Lấy danh sách tất cả spot pairs USDT trên MEXC"""
+    """
+    Lay pairs USDT tren MEXC, uu tien token nho (volume $3K-$2M/ngay).
+    Bot liquidity thuong chay tren micro token.
+    """
     try:
-        r = requests.get(f"{MEXC_BASE}/exchangeInfo", timeout=15)
+        import random
+        r = requests.get(f"{MEXC_BASE}/ticker/24hr", timeout=15)
         if r.status_code == 200:
-            symbols = r.json().get("symbols", [])
-            return [s["symbol"] for s in symbols
-                    if s.get("quoteAsset") == "USDT"
-                    and s.get("status") == "1"
-                    and s.get("isSpotTradingAllowed", True)]
+            tickers = r.json()
+            candidates = []
+            skip = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH","WBNB"}
+            for t in tickers:
+                sym = t.get("symbol","")
+                if not sym.endswith("USDT"):
+                    continue
+                if any(s in sym for s in skip):
+                    continue
+                try:
+                    vol_usdt = float(t.get("quoteVolume", 0) or 0)
+                    price    = float(t.get("lastPrice", 0) or 0)
+                except:
+                    continue
+                if 3_000 < vol_usdt < 2_000_000 and price > 0:
+                    candidates.append(sym)
+            random.shuffle(candidates)
+            return candidates
     except:
         pass
     return []
@@ -213,9 +230,9 @@ def analyze_range_bot(kdata):
     if l_min == 0:
         return None
 
-    # 1. Range height — phải hẹp (< 25%)
+    # 1. Range height — phải hẹp (< 35%)
     range_pct = (h_max - l_min) / l_min * 100
-    if range_pct > 25:
+    if range_pct > 35:
         return None
 
     # 2. Oscillation count — đếm số lần close cross qua midpoint
@@ -225,8 +242,8 @@ def analyze_range_bot(kdata):
         if (closes[i-1] < mid and closes[i] >= mid) or \
            (closes[i-1] >= mid and closes[i] < mid):
             crosses += 1
-    # Phải oscillate ít nhất 6 lần trong 72 nến
-    if crosses < 6:
+    # Phải oscillate ít nhất 4 lần trong 72 nến
+    if crosses < 4:
         return None
 
     # 3. Volume consistency — std dev thấp so với mean
@@ -236,7 +253,7 @@ def analyze_range_bot(kdata):
     vol_std = (sum((v - vol_mean)**2 for v in volumes) / len(volumes)) ** 0.5
     vol_cv = vol_std / vol_mean  # coefficient of variation — thấp = đều
     # Bot thường giữ volume đều, CV < 0.8
-    if vol_cv > 1.2:
+    if vol_cv > 1.8:
         return None
 
     # 4. Candle size consistency — biên độ nến đều nhau
@@ -676,10 +693,10 @@ with tab4:
     # Config
     c_cfg1, c_cfg2, c_cfg3 = st.columns(3)
     with c_cfg1:
-        max_range_pct = st.slider("Range tối đa (%)", 5, 25, 20, 1,
+        max_range_pct = st.slider("Range tối đa (%)", 5, 35, 30, 1,
             help="Token dao động trong range hẹp hơn mức này")
     with c_cfg2:
-        min_oscillations = st.slider("Oscillation tối thiểu", 4, 15, 6, 1,
+        min_oscillations = st.slider("Oscillation tối thiểu", 3, 15, 4, 1,
             help="Số lần giá cross qua midpoint trong 72 nến")
     with c_cfg3:
         max_scan_pairs = st.slider("Số pairs scan", 100, 500, 300, 50,
