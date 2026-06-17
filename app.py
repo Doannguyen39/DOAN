@@ -159,66 +159,92 @@ def get_gems_by_tags(search_tags):
     except: pass
     return []
 
-# ─── RANGE BOT SCANNER ────────────────────────────────────────────────────────
-MEXC_BASE = "https://api.mexc.com/api/v3"
+# ─── RANGE BOT SCANNER (CoinGecko) ──────────────────────────────────────────
+
+@st.cache_data(ttl=600)
+def get_cg_micro_ids(pages=4):
+    """Lấy danh sách coin ID micro-cap từ CoinGecko markets, nhiều page."""
+    coins = []
+    for page in range(1, pages + 1):
+        try:
+            r = requests.get(f"{COINGECKO_BASE}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "volume_desc",
+                    "per_page": 250,
+                    "page": page,
+                    "sparkline": "false",
+                    "price_change_percentage": "24h",
+                },
+                headers=CG_HEADERS, timeout=15)
+            if r.status_code == 200:
+                for c in r.json():
+                    mcap = c.get("market_cap") or 0
+                    vol  = c.get("total_volume") or 0
+                    # Micro-cap: mcap < $10M, volume $3K-$3M
+                    if mcap < 10_000_000 and 3_000 < vol < 3_000_000:
+                        coins.append({
+                            "id":     c["id"],
+                            "symbol": c["symbol"].upper(),
+                            "name":   c["name"],
+                            "price":  c.get("current_price", 0),
+                            "mcap":   mcap,
+                            "vol":    vol,
+                            "ch24":   c.get("price_change_percentage_24h", 0),
+                        })
+            elif r.status_code == 429:
+                break
+            time.sleep(0.5)
+        except:
+            break
+    return coins
 
 @st.cache_data(ttl=300)
-def get_mexc_usdt_pairs():
+def get_cg_ohlc(coin_id, days=3):
     """
-    Lay pairs USDT tren MEXC, uu tien token nho (volume $3K-$2M/ngay).
-    Bot liquidity thuong chay tren micro token.
+    Lấy nến OHLC từ CoinGecko.
+    days=3 → ~72 nến (1 nến/giờ với free tier trả về 4h candles, ~18 candles).
+    Dùng market_chart để lấy prices theo giờ rồi tự build OHLC.
     """
     try:
-        import random
-        r = requests.get(f"{MEXC_BASE}/ticker/24hr", timeout=15)
-        if r.status_code == 200:
-            tickers = r.json()
-            candidates = []
-            skip = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH","WBNB"}
-            for t in tickers:
-                sym = t.get("symbol","")
-                if not sym.endswith("USDT"):
-                    continue
-                if any(s in sym for s in skip):
-                    continue
-                try:
-                    vol_usdt = float(t.get("quoteVolume", 0) or 0)
-                    price    = float(t.get("lastPrice", 0) or 0)
-                except:
-                    continue
-                if 3_000 < vol_usdt < 2_000_000 and price > 0:
-                    candidates.append(sym)
-            random.shuffle(candidates)
-            return candidates
-    except:
-        pass
-    return []
+        r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
+            params={"vs_currency": "usd", "days": str(days), "interval": "hourly"},
+            headers=CG_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        prices = data.get("prices", [])       # [[timestamp, price], ...]
+        volumes = data.get("total_volumes", [])
+        if len(prices) < 20:
+            return None
 
-@st.cache_data(ttl=60)
-def get_mexc_klines(symbol, interval="1h", limit=72):
-    """Lấy nến H1 cho 1 symbol"""
-    try:
-        r = requests.get(f"{MEXC_BASE}/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=8)
-        if r.status_code == 200:
-            data = r.json()
-            if not data or len(data) < 20:
-                return None
-            # [open_time, open, high, low, close, volume, ...]
-            highs  = [float(c[2]) for c in data]
-            lows   = [float(c[3]) for c in data]
-            closes = [float(c[4]) for c in data]
-            volumes = [float(c[5]) for c in data]
-            return {"highs": highs, "lows": lows, "closes": closes, "volumes": volumes}
+        closes  = [p[1] for p in prices]
+        volumes_v = [v[1] for v in volumes] if volumes else [1.0] * len(closes)
+
+        # Build synthetic OHLC từ hourly closes (rolling window)
+        highs, lows = [], []
+        window = 1  # mỗi nến = 1 data point, high/low ≈ close ± price spread
+        for i, price in enumerate(closes):
+            # Lấy local high/low từ window lân cận
+            lo = max(0, i - 2)
+            hi = min(len(closes), i + 3)
+            neighborhood = closes[lo:hi]
+            highs.append(max(neighborhood))
+            lows.append(min(neighborhood))
+
+        return {
+            "highs":   highs,
+            "lows":    lows,
+            "closes":  closes,
+            "volumes": volumes_v,
+        }
     except:
-        pass
-    return None
+        return None
 
 def analyze_range_bot(kdata):
     """
-    Phát hiện token đang bị bot chạy liquidity trong range ổn định.
-    Returns dict với các metrics, hoặc None nếu không pass.
+    Phát hiện token đang dao động trong range ổn định (bot liquidity pattern).
+    Returns dict metrics hoặc None nếu không pass.
     """
     highs   = kdata["highs"]
     lows    = kdata["lows"]
@@ -230,101 +256,97 @@ def analyze_range_bot(kdata):
     if l_min == 0:
         return None
 
-    # 1. Range height — phải hẹp (< 35%)
+    # 1. Range height phải hẹp
     range_pct = (h_max - l_min) / l_min * 100
     if range_pct > 35:
         return None
 
-    # 2. Oscillation count — đếm số lần close cross qua midpoint
+    # 2. Oscillation — đếm lần close cross qua midpoint
     mid = (h_max + l_min) / 2
     crosses = 0
     for i in range(1, len(closes)):
-        if (closes[i-1] < mid and closes[i] >= mid) or \
-           (closes[i-1] >= mid and closes[i] < mid):
+        if (closes[i-1] < mid and closes[i] >= mid) or            (closes[i-1] >= mid and closes[i] < mid):
             crosses += 1
-    # Phải oscillate ít nhất 4 lần trong 72 nến
     if crosses < 4:
         return None
 
-    # 3. Volume consistency — std dev thấp so với mean
+    # 3. Volume consistency
     vol_mean = sum(volumes) / len(volumes) if volumes else 0
     if vol_mean == 0:
         return None
     vol_std = (sum((v - vol_mean)**2 for v in volumes) / len(volumes)) ** 0.5
-    vol_cv = vol_std / vol_mean  # coefficient of variation — thấp = đều
-    # Bot thường giữ volume đều, CV < 0.8
+    vol_cv  = vol_std / vol_mean
     if vol_cv > 1.8:
         return None
 
-    # 4. Candle size consistency — biên độ nến đều nhau
+    # 4. Candle size consistency
     candle_ranges = [(h - l) / l * 100 for h, l in zip(highs, lows) if l > 0]
-    avg_candle = sum(candle_ranges) / len(candle_ranges)
-    candle_std = (sum((c - avg_candle)**2 for c in candle_ranges) / len(candle_ranges)) ** 0.5
-    candle_cv = candle_std / avg_candle if avg_candle > 0 else 999
+    avg_candle = sum(candle_ranges) / len(candle_ranges) if candle_ranges else 0
+    candle_std = (sum((c - avg_candle)**2 for c in candle_ranges) / len(candle_ranges)) ** 0.5 if candle_ranges else 0
+    candle_cv  = candle_std / avg_candle if avg_candle > 0 else 999
 
-    # Score tổng hợp
-    score = 0
-    score += max(0, 40 - range_pct * 2)      # range càng hẹp càng tốt (max 40đ)
-    score += min(30, crosses * 2)              # oscillation nhiều (max 30đ)
-    score += max(0, 30 - vol_cv * 20)         # volume đều (max 30đ)
+    # Score
+    score  = max(0, 40 - range_pct * 1.5)
+    score += min(30, crosses * 2.5)
+    score += max(0, 30 - vol_cv * 15)
 
     current_price = closes[-1]
-    # Xác định vị trí hiện tại trong range
-    pos_in_range = (current_price - l_min) / (h_max - l_min) * 100 if (h_max - l_min) > 0 else 50
+    pos_in_range  = (current_price - l_min) / (h_max - l_min) * 100 if (h_max - l_min) > 0 else 50
 
-    # Tín hiệu buy/sell
     if pos_in_range <= 30:
-        signal = "🟢 BUY ZONE"
-        signal_color = "#3fb950"
+        signal, signal_color = "🟢 BUY ZONE",  "#3fb950"
     elif pos_in_range >= 70:
-        signal = "🔴 SELL ZONE"
-        signal_color = "#f85149"
+        signal, signal_color = "🔴 SELL ZONE", "#f85149"
     else:
-        signal = "⚪ MID RANGE"
-        signal_color = "#8b949e"
+        signal, signal_color = "⚪ MID RANGE",  "#8b949e"
 
     return {
-        "range_pct": range_pct,
-        "range_high": h_max,
-        "range_low": l_min,
-        "midpoint": mid,
+        "range_pct":    range_pct,
+        "range_high":   h_max,
+        "range_low":    l_min,
+        "midpoint":     mid,
         "current_price": current_price,
         "pos_in_range": pos_in_range,
         "oscillations": crosses,
-        "vol_cv": vol_cv,
-        "candle_cv": candle_cv,
-        "score": round(score, 1),
-        "signal": signal,
+        "vol_cv":       vol_cv,
+        "candle_cv":    candle_cv,
+        "score":        round(score, 1),
+        "signal":       signal,
         "signal_color": signal_color,
     }
 
 @st.cache_data(ttl=300)
 def scan_range_bots(max_scan=300):
-    """Scan toàn bộ MEXC spot, trả về list token có pattern range bot"""
-    pairs = get_mexc_usdt_pairs()
-    if not pairs:
-        return [], "Không lấy được danh sách pairs từ MEXC"
+    """Lấy micro-cap từ CoinGecko rồi scan OHLC tìm range bot pattern."""
+    coins = get_cg_micro_ids(pages=4)
+    if not coins:
+        return [], "Không lấy được danh sách token từ CoinGecko"
 
-    # Lọc bỏ stablecoin & wrapped
-    skip = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH"}
-    pairs = [p for p in pairs if not any(s in p for s in skip)]
-    pairs = pairs[:max_scan]
+    # Shuffle để đa dạng
+    import random
+    random.shuffle(coins)
+    coins = coins[:max_scan]
 
     results = []
-    errors = 0
-    for symbol in pairs:
+    errors  = 0
+    for coin in coins:
         try:
-            kdata = get_mexc_klines(symbol)
+            kdata = get_cg_ohlc(coin["id"], days=3)
             if not kdata:
+                time.sleep(0.3)
                 continue
             res = analyze_range_bot(kdata)
             if res:
-                res["symbol"] = symbol
+                res["symbol"] = coin["symbol"]
+                res["name"]   = coin["name"]
+                res["mcap"]   = coin["mcap"]
+                res["vol"]    = coin["vol"]
+                res["ch24"]   = coin["ch24"]
                 results.append(res)
-            time.sleep(0.05)  # tránh rate limit
+            time.sleep(0.35)   # CoinGecko free: ~30 req/min
         except:
             errors += 1
-            if errors > 20:
+            if errors > 15:
                 break
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -755,24 +777,26 @@ with tab4:
             st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(display)} token · Sắp xếp theo Bot Score cao nhất</div>', unsafe_allow_html=True)
 
             # Header
-            hcols = st.columns([1.8, 1, 1, 1.2, 1.2, 1.2, 1.5, 1.2])
-            for col, h in zip(hcols, ["Symbol", "Giá", "Range%", "Low", "Mid", "High", "Vị trí", "Score"]):
+            hcols = st.columns([2.2, 1, 1, 1, 1, 1, 1.5, 1])
+            for col, h in zip(hcols, ["Token", "Giá", "24h", "Range%", "Low", "High", "Vị trí", "Score"]):
                 col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
 
             for item in display:
-                cols = st.columns([1.8, 1, 1, 1.2, 1.2, 1.2, 1.5, 1.2])
-                cols[0].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{item["symbol"]}</div>', unsafe_allow_html=True)
+                cols = st.columns([2.2, 1, 1, 1, 1, 1, 1.5, 1])
+                cols[0].markdown(f'<div style="padding-top:6px;"><span style="font-weight:600;color:#58a6ff;">{item["symbol"]}</span> <span style="color:#8b949e;font-size:0.75rem;">{item.get("name","")[:14]}</span><br><span style="color:#484f58;font-size:0.72rem;">{fmt_usd(item.get("mcap",0))}</span></div>', unsafe_allow_html=True)
 
                 p = item["current_price"]
                 price_str = f"${p:.6f}" if p < 0.01 else f"${p:.4f}" if p < 1 else f"${p:.2f}"
                 cols[1].markdown(f'<div style="padding-top:8px;font-size:0.88rem;">{price_str}</div>', unsafe_allow_html=True)
-                cols[2].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.88rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
+
+                ch = item.get("ch24", 0) or 0
+                cols[2].markdown(f'<div style="color:{pct_color(ch)};padding-top:8px;font-size:0.85rem;">{pct_str(ch)}</div>', unsafe_allow_html=True)
+                cols[3].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.88rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
 
                 def fmt_p(v):
                     return f"${v:.6f}" if v < 0.01 else f"${v:.4f}" if v < 1 else f"${v:.2f}"
 
-                cols[3].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.82rem;">{fmt_p(item["range_low"])}</div>', unsafe_allow_html=True)
-                cols[4].markdown(f'<div style="padding-top:8px;color:#8b949e;font-size:0.82rem;">{fmt_p(item["midpoint"])}</div>', unsafe_allow_html=True)
+                cols[4].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.82rem;">{fmt_p(item["range_low"])}</div>', unsafe_allow_html=True)
                 cols[5].markdown(f'<div style="padding-top:8px;color:#3fb950;font-size:0.82rem;">{fmt_p(item["range_high"])}</div>', unsafe_allow_html=True)
 
                 # Progress bar vị trí trong range
