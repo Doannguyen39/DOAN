@@ -316,7 +316,7 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
         return None
     vol_std = (sum((v - vol_mean) ** 2 for v in volumes) / n) ** 0.5
     vol_cv  = vol_std / vol_mean
-    if vol_cv > 0.7:
+    if vol_cv > 0.85:
         return None
 
     # 5. NẾN đều (candle CV < 0.9)
