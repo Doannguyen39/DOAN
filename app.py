@@ -36,6 +36,8 @@ html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .badge-green{background:#0d2818;color:#3fb950;}
 .badge-red{background:#2d1212;color:#f85149;}
 .badge-yellow{background:#2d2208;color:#e3b341;}
+.badge-mexc{background:#1a2433;color:#58a6ff;}
+.badge-bitmart{background:#2a1e37;color:#a371f7;}
 .gem-row{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin-bottom:6px;}
 .gem-row:hover{border-color:#58a6ff;}
 .warning{background:#2d1a00;border:1px solid #d29922;border-radius:10px;padding:12px 16px;font-size:0.82rem;color:#e3b341;margin-top:12px;}
@@ -159,198 +161,261 @@ def get_gems_by_tags(search_tags):
     except: pass
     return []
 
-# ─── RANGE BOT SCANNER (CoinGecko) ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# RANGE BOT SCANNER — DATA SOURCE: MEXC + BITMART
+# ═══════════════════════════════════════════════════════════════════════════════
+MEXC_BASE    = "https://api.mexc.com/api/v3"
+BITMART_BASE = "https://api-cloud.bitmart.com"
 
-@st.cache_data(ttl=600)
-def get_cg_micro_ids(pages=4):
-    """Lấy danh sách coin ID micro-cap từ CoinGecko markets, nhiều page."""
-    coins = []
-    for page in range(1, pages + 1):
-        try:
-            r = requests.get(f"{COINGECKO_BASE}/coins/markets",
-                params={
-                    "vs_currency": "usd",
-                    "order": "volume_desc",
-                    "per_page": 250,
-                    "page": page,
-                    "sparkline": "false",
-                    "price_change_percentage": "24h",
-                },
-                headers=CG_HEADERS, timeout=15)
-            if r.status_code == 200:
-                for c in r.json():
-                    mcap = c.get("market_cap") or 0
-                    vol  = c.get("total_volume") or 0
-                    # Micro-cap: mcap < $10M, volume $3K-$3M
-                    if mcap < 10_000_000 and 3_000 < vol < 3_000_000:
-                        coins.append({
-                            "id":     c["id"],
-                            "symbol": c["symbol"].upper(),
-                            "name":   c["name"],
-                            "price":  c.get("current_price", 0),
-                            "mcap":   mcap,
-                            "vol":    vol,
-                            "ch24":   c.get("price_change_percentage_24h", 0),
-                        })
-            elif r.status_code == 429:
-                break
-            time.sleep(0.5)
-        except:
-            break
-    return coins
+SKIP_COINS = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH"}
 
+# ─── MEXC ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def get_cg_ohlc(coin_id, days=3):
+def get_mexc_usdt_pairs():
+    """Spot pairs USDT trên MEXC. Symbol dạng 'BTCUSDT'."""
+    try:
+        r = requests.get(f"{MEXC_BASE}/exchangeInfo", timeout=15)
+        if r.status_code == 200:
+            symbols = r.json().get("symbols", [])
+            return [s["symbol"] for s in symbols
+                    if s.get("quoteAsset") == "USDT"
+                    and s.get("status") == "1"
+                    and s.get("isSpotTradingAllowed", True)]
+    except:
+        pass
+    return []
+
+@st.cache_data(ttl=60)
+def get_mexc_klines(symbol, interval="60m", limit=72):
+    """Nến MEXC. interval dạng '60m' (H1), '15m' (M15). Data: cũ→mới."""
+    try:
+        r = requests.get(f"{MEXC_BASE}/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if not data or len(data) < 20:
+                return None
+            highs   = [float(c[2]) for c in data]
+            lows    = [float(c[3]) for c in data]
+            closes  = [float(c[4]) for c in data]
+            volumes = [float(c[5]) for c in data]
+            return {"highs": highs, "lows": lows, "closes": closes, "volumes": volumes}
+    except:
+        pass
+    return None
+
+# ─── BITMART ──────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def get_bitmart_usdt_pairs():
+    """Spot pairs USDT trên BitMart. Symbol dạng 'BTC_USDT'."""
+    try:
+        r = requests.get(f"{BITMART_BASE}/spot/v1/symbols", timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("code") != 1000:
+                return []
+            syms = j.get("data", {}).get("symbols", [])
+            return [s for s in syms if s.endswith("_USDT")]
+    except:
+        pass
+    return []
+
+@st.cache_data(ttl=60)
+def get_bitmart_klines(symbol, step=60, limit=72):
     """
-    Lấy nến OHLC từ CoinGecko.
-    days=3 → ~72 nến (1 nến/giờ với free tier trả về 4h candles, ~18 candles).
-    Dùng market_chart để lấy prices theo giờ rồi tự build OHLC.
+    Nến BitMart spot v3. step = PHÚT (60=H1, 15=M15, 5=M5).
+    Response [t,o,h,l,c,v,qv]. BitMart trả ĐẢO (mới→cũ) → sort lại cũ→mới.
     """
     try:
-        r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/market_chart",
-            params={"vs_currency": "usd", "days": str(days), "interval": "hourly"},
-            headers=CG_HEADERS, timeout=12)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        prices = data.get("prices", [])       # [[timestamp, price], ...]
-        volumes = data.get("total_volumes", [])
-        if len(prices) < 20:
-            return None
-
-        closes  = [p[1] for p in prices]
-        volumes_v = [v[1] for v in volumes] if volumes else [1.0] * len(closes)
-
-        # Build synthetic OHLC từ hourly closes (rolling window)
-        highs, lows = [], []
-        window = 1  # mỗi nến = 1 data point, high/low ≈ close ± price spread
-        for i, price in enumerate(closes):
-            # Lấy local high/low từ window lân cận
-            lo = max(0, i - 2)
-            hi = min(len(closes), i + 3)
-            neighborhood = closes[lo:hi]
-            highs.append(max(neighborhood))
-            lows.append(min(neighborhood))
-
-        return {
-            "highs":   highs,
-            "lows":    lows,
-            "closes":  closes,
-            "volumes": volumes_v,
+        now = int(time.time())
+        params = {
+            "symbol": symbol,
+            "step": step,
+            "after": now - (limit + 1) * step * 60,
+            "before": now,
         }
+        r = requests.get(f"{BITMART_BASE}/spot/quotation/v3/klines",
+                         params=params, timeout=8)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("code") != 1000:
+                return None
+            data = j.get("data", [])
+            if not data or len(data) < 20:
+                return None
+            data = sorted(data, key=lambda c: float(c[0]))  # cũ → mới
+            highs   = [float(c[2]) for c in data]
+            lows    = [float(c[3]) for c in data]
+            closes  = [float(c[4]) for c in data]
+            volumes = [float(c[5]) for c in data]
+            return {"highs": highs, "lows": lows, "closes": closes, "volumes": volumes}
     except:
-        return None
+        pass
+    return None
 
-def analyze_range_bot(kdata):
-    """
-    Phát hiện token đang dao động trong range ổn định (bot liquidity pattern).
-    Returns dict metrics hoặc None nếu không pass.
-    """
+# ─── ANALYZE RANGE BOT v2 (siết logic, loại false positive) ─────────────────────
+def analyze_range_bot(kdata, min_osc=4):
     highs   = kdata["highs"]
     lows    = kdata["lows"]
     closes  = kdata["closes"]
     volumes = kdata["volumes"]
+    n = len(closes)
+    if n < 20:
+        return None
 
     h_max = max(highs)
     l_min = min(lows)
-    if l_min == 0:
+    if l_min <= 0:
+        return None
+    span = h_max - l_min
+    if span <= 0:
         return None
 
-    # 1. Range height phải hẹp
-    range_pct = (h_max - l_min) / l_min * 100
-    if range_pct > 35:
+    # 1. Range hẹp (< 25%)
+    range_pct = span / l_min * 100
+    if range_pct > 25:
         return None
 
-    # 2. Oscillation — đếm lần close cross qua midpoint
-    mid = (h_max + l_min) / 2
-    crosses = 0
-    for i in range(1, len(closes)):
-        if (closes[i-1] < mid and closes[i] >= mid) or            (closes[i-1] >= mid and closes[i] < mid):
-            crosses += 1
-    if crosses < 4:
+    # 2. TREND FILTER — loại token đang trend (range bot phải đi ngang)
+    xs = list(range(n))
+    mean_x = sum(xs) / n
+    mean_y = sum(closes) / n
+    cov   = sum((xs[i] - mean_x) * (closes[i] - mean_y) for i in range(n))
+    var_x = sum((xs[i] - mean_x) ** 2 for i in range(n))
+    slope = cov / var_x if var_x > 0 else 0
+    trend_move  = abs(slope) * (n - 1)
+    trend_ratio = trend_move / span
+    if trend_ratio > 0.4:
         return None
 
-    # 3. Volume consistency
-    vol_mean = sum(volumes) / len(volumes) if volumes else 0
+    # 3. OSCILLATION đúng nghĩa — chạm xen kẽ 2 biên
+    upper_zone = l_min + span * 0.75
+    lower_zone = l_min + span * 0.25
+    touches = []
+    for i in range(n):
+        if highs[i] >= upper_zone:
+            if not touches or touches[-1] != 1:
+                touches.append(1)
+        elif lows[i] <= lower_zone:
+            if not touches or touches[-1] != -1:
+                touches.append(-1)
+    real_osc = len(touches) - 1 if len(touches) > 1 else 0
+    if real_osc < min_osc:
+        return None
+
+    # 4. VOLUME đều (CV < 0.7)
+    vol_mean = sum(volumes) / n if volumes else 0
     if vol_mean == 0:
         return None
-    vol_std = (sum((v - vol_mean)**2 for v in volumes) / len(volumes)) ** 0.5
+    vol_std = (sum((v - vol_mean) ** 2 for v in volumes) / n) ** 0.5
     vol_cv  = vol_std / vol_mean
-    if vol_cv > 1.8:
+    if vol_cv > 0.7:
         return None
 
-    # 4. Candle size consistency
-    candle_ranges = [(h - l) / l * 100 for h, l in zip(highs, lows) if l > 0]
+    # 5. NẾN đều (candle CV < 0.9)
+    candle_ranges = [(highs[i] - lows[i]) / lows[i] * 100 for i in range(n) if lows[i] > 0]
     avg_candle = sum(candle_ranges) / len(candle_ranges) if candle_ranges else 0
-    candle_std = (sum((c - avg_candle)**2 for c in candle_ranges) / len(candle_ranges)) ** 0.5 if candle_ranges else 0
+    candle_std = (sum((c - avg_candle) ** 2 for c in candle_ranges) / len(candle_ranges)) ** 0.5 if candle_ranges else 999
     candle_cv  = candle_std / avg_candle if avg_candle > 0 else 999
+    if candle_cv > 0.9:
+        return None
 
-    # Score
-    score  = max(0, 40 - range_pct * 1.5)
-    score += min(30, crosses * 2.5)
-    score += max(0, 30 - vol_cv * 15)
+    # SCORE
+    score = 0
+    score += max(0, 30 - range_pct * 1.2)
+    score += min(20, real_osc * 2)
+    score += max(0, 20 - vol_cv * 25)
+    score += max(0, 15 - candle_cv * 12)
+    score += max(0, 15 - trend_ratio * 30)
 
     current_price = closes[-1]
-    pos_in_range  = (current_price - l_min) / (h_max - l_min) * 100 if (h_max - l_min) > 0 else 50
+    pos_in_range  = (current_price - l_min) / span * 100
 
     if pos_in_range <= 30:
-        signal, signal_color = "🟢 BUY ZONE",  "#3fb950"
+        signal, signal_color = "🟢 BUY ZONE", "#3fb950"
     elif pos_in_range >= 70:
         signal, signal_color = "🔴 SELL ZONE", "#f85149"
     else:
-        signal, signal_color = "⚪ MID RANGE",  "#8b949e"
+        signal, signal_color = "⚪ MID RANGE", "#8b949e"
 
     return {
-        "range_pct":    range_pct,
-        "range_high":   h_max,
-        "range_low":    l_min,
-        "midpoint":     mid,
+        "range_pct": range_pct,
+        "range_high": h_max,
+        "range_low": l_min,
+        "midpoint": (h_max + l_min) / 2,
         "current_price": current_price,
         "pos_in_range": pos_in_range,
-        "oscillations": crosses,
-        "vol_cv":       vol_cv,
-        "candle_cv":    candle_cv,
-        "score":        round(score, 1),
-        "signal":       signal,
+        "oscillations": real_osc,
+        "vol_cv": vol_cv,
+        "candle_cv": candle_cv,
+        "trend_ratio": trend_ratio,
+        "score": round(score, 1),
+        "signal": signal,
         "signal_color": signal_color,
     }
 
+# ─── SCAN MULTI-SÀN (MEXC + BITMART) ────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def scan_range_bots(max_scan=300):
-    """Lấy micro-cap từ CoinGecko rồi scan OHLC tìm range bot pattern."""
-    coins = get_cg_micro_ids(pages=4)
-    if not coins:
-        return [], "Không lấy được danh sách token từ CoinGecko"
-
-    # Shuffle để đa dạng
-    import random
-    random.shuffle(coins)
-    coins = coins[:max_scan]
-
+def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=True):
+    """Quét range bot trên MEXC + BitMart, gộp kết quả. tf_minutes: 60=H1, 15=M15, 5=M5."""
     results = []
-    errors  = 0
-    for coin in coins:
-        try:
-            kdata = get_cg_ohlc(coin["id"], days=3)
-            if not kdata:
-                time.sleep(0.3)
-                continue
-            res = analyze_range_bot(kdata)
-            if res:
-                res["symbol"] = coin["symbol"]
-                res["name"]   = coin["name"]
-                res["mcap"]   = coin["mcap"]
-                res["vol"]    = coin["vol"]
-                res["ch24"]   = coin["ch24"]
-                results.append(res)
-            time.sleep(0.35)   # CoinGecko free: ~30 req/min
-        except:
-            errors += 1
-            if errors > 15:
-                break
+    any_pairs = False
+
+    # MEXC interval string theo phút
+    mexc_interval = f"{tf_minutes}m" if tf_minutes < 60 else "60m" if tf_minutes == 60 else "4h"
+
+    # ---- MEXC ----
+    if scan_mexc:
+        pairs = get_mexc_usdt_pairs()
+        if pairs:
+            any_pairs = True
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)][:max_scan]
+            errors = 0
+            for symbol in pairs:
+                try:
+                    kdata = get_mexc_klines(symbol, interval=mexc_interval)
+                    if not kdata:
+                        continue
+                    res = analyze_range_bot(kdata)
+                    if res:
+                        res["symbol"]   = symbol
+                        res["exchange"] = "MEXC"
+                        results.append(res)
+                    time.sleep(0.05)
+                except:
+                    errors += 1
+                    if errors > 30:
+                        break
+
+    # ---- BITMART ----
+    if scan_bitmart:
+        pairs = get_bitmart_usdt_pairs()
+        if pairs:
+            any_pairs = True
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)][:max_scan]
+            errors = 0
+            for symbol in pairs:
+                try:
+                    kdata = get_bitmart_klines(symbol, step=tf_minutes)
+                    if not kdata:
+                        continue
+                    res = analyze_range_bot(kdata)
+                    if res:
+                        res["symbol"]   = symbol
+                        res["exchange"] = "BitMart"
+                        results.append(res)
+                    time.sleep(0.3)  # BitMart rate limit thấp
+                except:
+                    errors += 1
+                    if errors > 30:
+                        break
+
+    if not any_pairs:
+        return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:50], None
+    return results[:80], None
 
 def analyze_narrative(gainers):
     nmap={"artificial-intelligence":"🤖 AI / Agent","ai":"🤖 AI / Agent","agent":"🤖 AI / Agent",
@@ -449,7 +514,7 @@ def score_token(data):
 st.markdown("""
 <div class="main-header">
     <p class="main-title">💎 Gem Hunter</p>
-    <p style="color:#8b949e;font-size:0.9rem;margin-top:8px;">Phân tích token micro-cap · Narrative Scanner · Dữ liệu realtime</p>
+    <p style="color:#8b949e;font-size:0.9rem;margin-top:8px;">Phân tích token micro-cap · Narrative Scanner · Range Bot · Dữ liệu realtime</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -620,7 +685,6 @@ with tab3:
             top_narr = list(nc.keys())[0] if nc else ""
             top_count = list(nc.values())[0] if nc else 0
 
-            # Hot narrative banner
             st.markdown(f"""
             <div style="background:linear-gradient(135deg,#1a2e1a,#0d1117);border:1px solid #3fb950;border-radius:12px;padding:18px;margin-bottom:16px;text-align:center;">
                 <div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.1em;">Narrative đang HOT</div>
@@ -629,7 +693,6 @@ with tab3:
             </div>
             """, unsafe_allow_html=True)
 
-            # Narrative breakdown
             st.markdown('<div class="sec">📊 Phân bổ Narrative</div>', unsafe_allow_html=True)
             ncols = st.columns(min(len(nc), 4))
             for i, (narr, cnt) in enumerate(list(nc.items())[:4]):
@@ -646,7 +709,6 @@ with tab3:
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # Top gainers table
             st.markdown(f'<div class="sec">🚀 Top {len(gainers)} token +30%+ (7 ngày) · Mcap < $5M</div>', unsafe_allow_html=True)
             hcols=st.columns([2,1.2,1.2,1.2,1.2,2])
             for col,h in zip(hcols,["Token","Giá","7 ngày","24h","Mcap","Narrative"]):
@@ -661,7 +723,6 @@ with tab3:
                 tags_html=" ".join([f'<span class="badge badge-purple">{tg[:12]}</span>' for tg in t["tags"][:2]])
                 cols[5].markdown(f'<div style="padding-top:6px;">{tags_html}</div>',unsafe_allow_html=True)
 
-            # Hidden gems
             st.markdown("<br>", unsafe_allow_html=True)
             st.markdown('<div class="sec">💎 Gem chưa pump — cùng narrative đang hot</div>', unsafe_allow_html=True)
 
@@ -707,112 +768,122 @@ with tab4:
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
         <div style="font-weight:600;color:#e6edf3;">🤖 Range Bot Scanner</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
-            Phát hiện token đang bị bot dev chạy liquidity trong range ổn định · H1 · 72 nến · MEXC Spot · Cache 5 phút
+            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + BitMart Spot · Cache 5 phút
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Config
+    # Chọn sàn + khung thời gian
+    c_ex1, c_ex2, c_tf = st.columns([1.2, 1.2, 1.6])
+    with c_ex1:
+        use_mexc = st.checkbox("MEXC", value=True, key="rb_mexc")
+    with c_ex2:
+        use_bitmart = st.checkbox("BitMart", value=True, key="rb_bitmart")
+    with c_tf:
+        tf_label = st.selectbox("Khung thời gian", ["M5", "M15", "H1"], index=1, key="rb_tf",
+            help="Range bot thấy rõ nhất ở M15")
+    tf_map = {"M5": 5, "M15": 15, "H1": 60}
+    tf_minutes = tf_map[tf_label]
+
+    # Config filter
     c_cfg1, c_cfg2, c_cfg3 = st.columns(3)
     with c_cfg1:
-        max_range_pct = st.slider("Range tối đa (%)", 5, 35, 30, 1,
+        max_range_pct = st.slider("Range tối đa (%)", 5, 25, 20, 1,
             help="Token dao động trong range hẹp hơn mức này")
     with c_cfg2:
-        min_oscillations = st.slider("Oscillation tối thiểu", 3, 15, 4, 1,
-            help="Số lần giá cross qua midpoint trong 72 nến")
+        min_oscillations = st.slider("Oscillation tối thiểu", 2, 15, 4, 1,
+            help="Số lần giá chuyển xen kẽ giữa biên trên và biên dưới")
     with c_cfg3:
-        max_scan_pairs = st.slider("Số pairs scan", 100, 500, 300, 50,
-            help="Nhiều hơn = chậm hơn (~1-3 phút)")
+        max_scan_pairs = st.slider("Số pairs scan / sàn", 100, 500, 300, 50,
+            help="Nhiều hơn = chậm hơn")
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
         scan_btn = st.button("🔄 Scan ngay", use_container_width=True, key="range_scan_btn")
     with col_info:
-        st.markdown('<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Scan ~300 pairs mất khoảng 1-2 phút · Kết quả cache 5 phút</div>', unsafe_allow_html=True)
+        est = ""
+        if use_bitmart:
+            est = " · BitMart rate limit thấp nên chậm hơn (~2-3 phút)"
+        st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Quét theo từng sàn đã chọn · Cache 5 phút{est}</div>', unsafe_allow_html=True)
 
     if scan_btn:
         st.cache_data.clear()
 
-    # Auto-load hoặc sau khi bấm scan
-    with st.spinner(f"🔍 Đang scan {max_scan_pairs} pairs trên MEXC..."):
-        range_results, scan_err = scan_range_bots(max_scan=max_scan_pairs)
-
-    if scan_err:
-        st.error(f"Lỗi: {scan_err}")
-    elif not range_results:
-        st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa hoặc giảm Oscillation tối thiểu.")
+    if not use_mexc and not use_bitmart:
+        st.warning("⚠️ Chọn ít nhất 1 sàn để scan.")
     else:
-        # Lọc thêm theo config người dùng
-        filtered = [r for r in range_results
-                    if r["range_pct"] <= max_range_pct
-                    and r["oscillations"] >= min_oscillations]
+        ex_txt = " + ".join([x for x, on in [("MEXC", use_mexc), ("BitMart", use_bitmart)] if on])
+        with st.spinner(f"🔍 Đang scan {ex_txt} · {tf_label}..."):
+            range_results, scan_err = scan_range_bots(
+                max_scan=max_scan_pairs, tf_minutes=tf_minutes,
+                scan_mexc=use_mexc, scan_bitmart=use_bitmart)
 
-        # Summary metrics
-        buy_zone  = [r for r in filtered if "BUY"  in r["signal"]]
-        sell_zone = [r for r in filtered if "SELL" in r["signal"]]
-        mid_zone  = [r for r in filtered if "MID"  in r["signal"]]
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#58a6ff">{len(filtered)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">TOKEN TÌM THẤY</div></div>', unsafe_allow_html=True)
-        m2.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#3fb950">{len(buy_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🟢 BUY ZONE</div></div>', unsafe_allow_html=True)
-        m3.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#f85149">{len(sell_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🔴 SELL ZONE</div></div>', unsafe_allow_html=True)
-        m4.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#8b949e">{len(mid_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">⚪ MID RANGE</div></div>', unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # Filter hiển thị
-        show_filter = st.radio("Hiển thị:", ["Tất cả", "🟢 Buy Zone", "🔴 Sell Zone"],
-                               horizontal=True, key="rb_filter")
-
-        if show_filter == "🟢 Buy Zone":
-            display = buy_zone
-        elif show_filter == "🔴 Sell Zone":
-            display = sell_zone
+        if scan_err:
+            st.error(f"Lỗi: {scan_err}")
+        elif not range_results:
+            st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa hoặc giảm Oscillation tối thiểu.")
         else:
-            display = filtered
+            # Lọc theo config người dùng
+            filtered = [r for r in range_results
+                        if r["range_pct"] <= max_range_pct
+                        and r["oscillations"] >= min_oscillations]
 
-        if not display:
-            st.info("Không có token trong zone này.")
-        else:
-            st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(display)} token · Sắp xếp theo Bot Score cao nhất</div>', unsafe_allow_html=True)
+            buy_zone  = [r for r in filtered if "BUY"  in r["signal"]]
+            sell_zone = [r for r in filtered if "SELL" in r["signal"]]
+            mid_zone  = [r for r in filtered if "MID"  in r["signal"]]
 
-            # Header
-            hcols = st.columns([2.2, 1, 1, 1, 1, 1, 1.5, 1])
-            for col, h in zip(hcols, ["Token", "Giá", "24h", "Range%", "Low", "High", "Vị trí", "Score"]):
-                col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#58a6ff">{len(filtered)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">TOKEN TÌM THẤY</div></div>', unsafe_allow_html=True)
+            m2.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#3fb950">{len(buy_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🟢 BUY ZONE</div></div>', unsafe_allow_html=True)
+            m3.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#f85149">{len(sell_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🔴 SELL ZONE</div></div>', unsafe_allow_html=True)
+            m4.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#8b949e">{len(mid_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">⚪ MID RANGE</div></div>', unsafe_allow_html=True)
 
-            for item in display:
-                cols = st.columns([2.2, 1, 1, 1, 1, 1, 1.5, 1])
-                cols[0].markdown(f'<div style="padding-top:6px;"><span style="font-weight:600;color:#58a6ff;">{item["symbol"]}</span> <span style="color:#8b949e;font-size:0.75rem;">{item.get("name","")[:14]}</span><br><span style="color:#484f58;font-size:0.72rem;">{fmt_usd(item.get("mcap",0))}</span></div>', unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
 
-                p = item["current_price"]
-                price_str = f"${p:.6f}" if p < 0.01 else f"${p:.4f}" if p < 1 else f"${p:.2f}"
-                cols[1].markdown(f'<div style="padding-top:8px;font-size:0.88rem;">{price_str}</div>', unsafe_allow_html=True)
+            show_filter = st.radio("Hiển thị:", ["Tất cả", "🟢 Buy Zone", "🔴 Sell Zone"],
+                                   horizontal=True, key="rb_filter")
 
-                ch = item.get("ch24", 0) or 0
-                cols[2].markdown(f'<div style="color:{pct_color(ch)};padding-top:8px;font-size:0.85rem;">{pct_str(ch)}</div>', unsafe_allow_html=True)
-                cols[3].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.88rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
+            if show_filter == "🟢 Buy Zone":
+                display = buy_zone
+            elif show_filter == "🔴 Sell Zone":
+                display = sell_zone
+            else:
+                display = filtered
+
+            if not display:
+                st.info("Không có token trong zone này.")
+            else:
+                st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(display)} token · Sắp xếp theo Bot Score cao nhất</div>', unsafe_allow_html=True)
+
+                hcols = st.columns([1, 1.8, 1, 1, 1.2, 1.2, 1.4, 1])
+                for col, h in zip(hcols, ["Sàn", "Symbol", "Giá", "Range%", "Low", "High", "Vị trí", "Score"]):
+                    col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
 
                 def fmt_p(v):
                     return f"${v:.6f}" if v < 0.01 else f"${v:.4f}" if v < 1 else f"${v:.2f}"
 
-                cols[4].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.82rem;">{fmt_p(item["range_low"])}</div>', unsafe_allow_html=True)
-                cols[5].markdown(f'<div style="padding-top:8px;color:#3fb950;font-size:0.82rem;">{fmt_p(item["range_high"])}</div>', unsafe_allow_html=True)
+                for item in display:
+                    cols = st.columns([1, 1.8, 1, 1, 1.2, 1.2, 1.4, 1])
+                    ex = item.get("exchange", "")
+                    ex_badge = "badge-mexc" if ex == "MEXC" else "badge-bitmart"
+                    cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {ex_badge}">{ex}</span></div>', unsafe_allow_html=True)
+                    cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{item["symbol"]}</div>', unsafe_allow_html=True)
+                    cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{fmt_p(item["current_price"])}</div>', unsafe_allow_html=True)
+                    cols[3].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.85rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
+                    cols[4].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.8rem;">{fmt_p(item["range_low"])}</div>', unsafe_allow_html=True)
+                    cols[5].markdown(f'<div style="padding-top:8px;color:#3fb950;font-size:0.8rem;">{fmt_p(item["range_high"])}</div>', unsafe_allow_html=True)
+                    pos = item["pos_in_range"]
+                    bar_color = item["signal_color"]
+                    cols[6].markdown(f"""
+                    <div style="padding-top:10px;">
+                        <div style="background:#21262d;border-radius:4px;height:6px;width:100%;">
+                            <div style="background:{bar_color};width:{pos:.0f}%;height:6px;border-radius:4px;"></div>
+                        </div>
+                        <div style="color:{bar_color};font-size:0.7rem;margin-top:3px;">{item["signal"]} · {pos:.0f}%</div>
+                    </div>""", unsafe_allow_html=True)
+                    score_color = "#3fb950" if item["score"] >= 60 else "#d29922" if item["score"] >= 40 else "#8b949e"
+                    cols[7].markdown(f'<div style="padding-top:8px;font-weight:700;color:{score_color};">{item["score"]}</div>', unsafe_allow_html=True)
 
-                # Progress bar vị trí trong range
-                pos = item["pos_in_range"]
-                bar_color = item["signal_color"]
-                cols[6].markdown(f"""
-                <div style="padding-top:10px;">
-                    <div style="background:#21262d;border-radius:4px;height:6px;width:100%;">
-                        <div style="background:{bar_color};width:{pos:.0f}%;height:6px;border-radius:4px;"></div>
-                    </div>
-                    <div style="color:{bar_color};font-size:0.72rem;margin-top:3px;">{item["signal"]} · {pos:.0f}%</div>
-                </div>""", unsafe_allow_html=True)
+                st.markdown('<div class="warning">⚠️ Range bot pattern không đảm bảo giá sẽ tiếp tục sideway. Bot có thể dừng bất kỳ lúc nào → giá dump. Luôn đặt SL chặt ngoài range.</div>', unsafe_allow_html=True)
 
-                score_color = "#3fb950" if item["score"] >= 60 else "#d29922" if item["score"] >= 40 else "#8b949e"
-                cols[7].markdown(f'<div style="padding-top:8px;font-weight:700;color:{score_color};">{item["score"]}</div>', unsafe_allow_html=True)
-
-            st.markdown('<div class="warning">⚠️ Range bot pattern không đảm bảo giá sẽ tiếp tục sideway. Bot có thể dừng bất kỳ lúc nào → giá dump. Luôn đặt SL chặt.</div>', unsafe_allow_html=True)
-
-st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC · Research only</div>', unsafe_allow_html=True)
+st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC + BitMart · Research only</div>', unsafe_allow_html=True)
