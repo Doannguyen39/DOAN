@@ -276,9 +276,9 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
     if span <= 0:
         return None
 
-    # 1. Range trong khoảng [min_range_pct, 25%]
+    # 1. Range trong khoảng [min_range_pct, 40%]
     range_pct = span / l_min * 100
-    if range_pct > 25:
+    if range_pct > 40:
         return None
     if range_pct < min_range_pct:   # quá hẹp → không bù nổi phí
         return None
@@ -796,10 +796,10 @@ with tab4:
     # Config filter
     c_cfg1, c_cfg2, c_cfg3, c_cfg4 = st.columns(4)
     with c_cfg1:
-        min_range_pct = st.slider("Range tối thiểu (%)", 0.1, 5.0, 0.5, 0.1,
-            help="Range phải đủ rộng để bù phí. MEXC ≥0.3%, BitMart ≥1% mới có lời thực")
+        min_range_pct = st.slider("Range tối thiểu (%)", 1.0, 20.0, 5.0, 0.5,
+            help="Chỉ lấy token range đủ rộng để bõ công canh tay. Mặc định ≥5%")
     with c_cfg2:
-        max_range_pct = st.slider("Range tối đa (%)", 5, 25, 20, 1,
+        max_range_pct = st.slider("Range tối đa (%)", 5, 40, 30, 1,
             help="Token dao động trong range hẹp hơn mức này")
     with c_cfg3:
         min_oscillations = st.slider("Oscillation tối thiểu", 2, 15, 4, 1,
@@ -808,7 +808,10 @@ with tab4:
         max_scan_pairs = st.slider("Số pairs scan / sàn", 100, 500, 300, 50,
             help="Nhiều hơn = chậm hơn")
 
-    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Phí round-trip: MEXC ~0.1% · BitMart ~0.5%. Cột <b>Net%</b> = range trừ phí — chỉ chọn token Net dương.</div>', unsafe_allow_html=True)
+    if min_range_pct >= max_range_pct:
+        st.warning(f"⚠️ Range tối thiểu ({min_range_pct}%) ≥ tối đa ({max_range_pct}%) → sẽ không ra token. Giảm tối thiểu hoặc tăng tối đa.")
+
+    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Range rộng = ăn đậm mỗi cú nhưng SỐ token ít hơn nhiều. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · BitMart ~0.5%) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
