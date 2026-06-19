@@ -169,6 +169,10 @@ BITMART_BASE = "https://api-cloud.bitmart.com"
 
 SKIP_COINS = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH"}
 
+# Phí round-trip (mua + bán) theo sàn, % — dùng taker chuẩn (an toàn)
+# MEXC: taker 0.05% × 2. BitMart: 0.25% × 2. Nếu đặt limit (maker) thì MEXC ~0%.
+FEE_ROUNDTRIP = {"MEXC": 0.1, "BitMart": 0.5}
+
 # ─── MEXC ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def get_mexc_usdt_pairs():
@@ -255,7 +259,7 @@ def get_bitmart_klines(symbol, step=60, limit=72):
     return None
 
 # ─── ANALYZE RANGE BOT v2 (siết logic, loại false positive) ─────────────────────
-def analyze_range_bot(kdata, min_osc=4):
+def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
     highs   = kdata["highs"]
     lows    = kdata["lows"]
     closes  = kdata["closes"]
@@ -272,9 +276,11 @@ def analyze_range_bot(kdata, min_osc=4):
     if span <= 0:
         return None
 
-    # 1. Range hẹp (< 25%)
+    # 1. Range trong khoảng [min_range_pct, 25%]
     range_pct = span / l_min * 100
     if range_pct > 25:
+        return None
+    if range_pct < min_range_pct:   # quá hẹp → không bù nổi phí
         return None
 
     # 2. TREND FILTER — loại token đang trend (range bot phải đi ngang)
@@ -357,7 +363,7 @@ def analyze_range_bot(kdata, min_osc=4):
 
 # ─── SCAN MULTI-SÀN (MEXC + BITMART) ────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=True):
+def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=True, min_range_pct=0.5):
     """Quét range bot trên MEXC + BitMart, gộp kết quả. tf_minutes: 60=H1, 15=M15, 5=M5."""
     results = []
     any_pairs = False
@@ -377,10 +383,11 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
                     kdata = get_mexc_klines(symbol, interval=mexc_interval)
                     if not kdata:
                         continue
-                    res = analyze_range_bot(kdata)
+                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct)
                     if res:
                         res["symbol"]   = symbol
                         res["exchange"] = "MEXC"
+                        res["net_edge"] = round(res["range_pct"] - FEE_ROUNDTRIP["MEXC"], 2)
                         results.append(res)
                     time.sleep(0.05)
                 except:
@@ -400,10 +407,11 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
                     kdata = get_bitmart_klines(symbol, step=tf_minutes)
                     if not kdata:
                         continue
-                    res = analyze_range_bot(kdata)
+                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct)
                     if res:
                         res["symbol"]   = symbol
                         res["exchange"] = "BitMart"
+                        res["net_edge"] = round(res["range_pct"] - FEE_ROUNDTRIP["BitMart"], 2)
                         results.append(res)
                     time.sleep(0.3)  # BitMart rate limit thấp
                 except:
@@ -786,16 +794,21 @@ with tab4:
     tf_minutes = tf_map[tf_label]
 
     # Config filter
-    c_cfg1, c_cfg2, c_cfg3 = st.columns(3)
+    c_cfg1, c_cfg2, c_cfg3, c_cfg4 = st.columns(4)
     with c_cfg1:
+        min_range_pct = st.slider("Range tối thiểu (%)", 0.1, 5.0, 0.5, 0.1,
+            help="Range phải đủ rộng để bù phí. MEXC ≥0.3%, BitMart ≥1% mới có lời thực")
+    with c_cfg2:
         max_range_pct = st.slider("Range tối đa (%)", 5, 25, 20, 1,
             help="Token dao động trong range hẹp hơn mức này")
-    with c_cfg2:
+    with c_cfg3:
         min_oscillations = st.slider("Oscillation tối thiểu", 2, 15, 4, 1,
             help="Số lần giá chuyển xen kẽ giữa biên trên và biên dưới")
-    with c_cfg3:
+    with c_cfg4:
         max_scan_pairs = st.slider("Số pairs scan / sàn", 100, 500, 300, 50,
             help="Nhiều hơn = chậm hơn")
+
+    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Phí round-trip: MEXC ~0.1% · BitMart ~0.5%. Cột <b>Net%</b> = range trừ phí — chỉ chọn token Net dương.</div>', unsafe_allow_html=True)
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
@@ -816,7 +829,8 @@ with tab4:
         with st.spinner(f"🔍 Đang scan {ex_txt} · {tf_label}..."):
             range_results, scan_err = scan_range_bots(
                 max_scan=max_scan_pairs, tf_minutes=tf_minutes,
-                scan_mexc=use_mexc, scan_bitmart=use_bitmart)
+                scan_mexc=use_mexc, scan_bitmart=use_bitmart,
+                min_range_pct=min_range_pct)
 
         if scan_err:
             st.error(f"Lỗi: {scan_err}")
@@ -855,26 +869,29 @@ with tab4:
             else:
                 st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(display)} token · Sắp xếp theo Bot Score cao nhất</div>', unsafe_allow_html=True)
 
-                hcols = st.columns([1, 1.8, 1, 1, 1.2, 1.2, 1.4, 1])
-                for col, h in zip(hcols, ["Sàn", "Symbol", "Giá", "Range%", "Low", "High", "Vị trí", "Score"]):
+                hcols = st.columns([1, 1.7, 1, 1, 1, 1.1, 1.1, 1.3, 1])
+                for col, h in zip(hcols, ["Sàn", "Symbol", "Giá", "Range%", "Net%", "Low", "High", "Vị trí", "Score"]):
                     col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
 
                 def fmt_p(v):
                     return f"${v:.6f}" if v < 0.01 else f"${v:.4f}" if v < 1 else f"${v:.2f}"
 
                 for item in display:
-                    cols = st.columns([1, 1.8, 1, 1, 1.2, 1.2, 1.4, 1])
+                    cols = st.columns([1, 1.7, 1, 1, 1, 1.1, 1.1, 1.3, 1])
                     ex = item.get("exchange", "")
                     ex_badge = "badge-mexc" if ex == "MEXC" else "badge-bitmart"
                     cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {ex_badge}">{ex}</span></div>', unsafe_allow_html=True)
                     cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{item["symbol"]}</div>', unsafe_allow_html=True)
                     cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{fmt_p(item["current_price"])}</div>', unsafe_allow_html=True)
                     cols[3].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.85rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
-                    cols[4].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.8rem;">{fmt_p(item["range_low"])}</div>', unsafe_allow_html=True)
-                    cols[5].markdown(f'<div style="padding-top:8px;color:#3fb950;font-size:0.8rem;">{fmt_p(item["range_high"])}</div>', unsafe_allow_html=True)
+                    net = item.get("net_edge", 0)
+                    net_color = "#3fb950" if net >= 0.3 else "#d29922" if net > 0 else "#f85149"
+                    cols[4].markdown(f'<div style="padding-top:8px;color:{net_color};font-size:0.85rem;font-weight:600;">{net:+.2f}%</div>', unsafe_allow_html=True)
+                    cols[5].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.78rem;">{fmt_p(item["range_low"])}</div>', unsafe_allow_html=True)
+                    cols[6].markdown(f'<div style="padding-top:8px;color:#3fb950;font-size:0.78rem;">{fmt_p(item["range_high"])}</div>', unsafe_allow_html=True)
                     pos = item["pos_in_range"]
                     bar_color = item["signal_color"]
-                    cols[6].markdown(f"""
+                    cols[7].markdown(f"""
                     <div style="padding-top:10px;">
                         <div style="background:#21262d;border-radius:4px;height:6px;width:100%;">
                             <div style="background:{bar_color};width:{pos:.0f}%;height:6px;border-radius:4px;"></div>
@@ -882,8 +899,8 @@ with tab4:
                         <div style="color:{bar_color};font-size:0.7rem;margin-top:3px;">{item["signal"]} · {pos:.0f}%</div>
                     </div>""", unsafe_allow_html=True)
                     score_color = "#3fb950" if item["score"] >= 60 else "#d29922" if item["score"] >= 40 else "#8b949e"
-                    cols[7].markdown(f'<div style="padding-top:8px;font-weight:700;color:{score_color};">{item["score"]}</div>', unsafe_allow_html=True)
+                    cols[8].markdown(f'<div style="padding-top:8px;font-weight:700;color:{score_color};">{item["score"]}</div>', unsafe_allow_html=True)
 
-                st.markdown('<div class="warning">⚠️ Range bot pattern không đảm bảo giá sẽ tiếp tục sideway. Bot có thể dừng bất kỳ lúc nào → giá dump. Luôn đặt SL chặt ngoài range.</div>', unsafe_allow_html=True)
+                st.markdown('<div class="warning">⚠️ Net% = range trừ phí round-trip (đã ăn được nguyên range — thực tế còn ít hơn). Net dương chỉ là điều kiện CẦN. Bot có thể dừng bất kỳ lúc nào → giá dump. Luôn đặt SL chặt ngoài range.</div>', unsafe_allow_html=True)
 
 st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC + BitMart · Research only</div>', unsafe_allow_html=True)
