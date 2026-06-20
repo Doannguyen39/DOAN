@@ -363,10 +363,11 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
 
 # ─── SCAN MULTI-SÀN (MEXC + BITMART) ────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=True, min_range_pct=0.5):
-    """Quét range bot trên MEXC + BitMart, gộp kết quả. tf_minutes: 60=H1, 15=M15, 5=M5."""
+def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=True, min_range_pct=0.5, watchlist=()):
+    """Quét range bot MEXC + BitMart. watchlist: token luôn scan đầu tiên, không bị cắt."""
     results = []
     any_pairs = False
+    wl = set(s.strip().upper() for s in watchlist if s.strip())
 
     # MEXC interval string theo phút
     mexc_interval = f"{tf_minutes}m" if tf_minutes < 60 else "60m" if tf_minutes == 60 else "4h"
@@ -376,7 +377,11 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
         pairs = get_mexc_usdt_pairs()
         if pairs:
             any_pairs = True
-            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)][:max_scan]
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)]
+            # watchlist lên đầu (không bị cắt), phần còn lại giới hạn max_scan
+            wl_p  = [p for p in pairs if p in wl]
+            rest  = [p for p in pairs if p not in wl][:max_scan]
+            pairs = wl_p + rest
             errors = 0
             for symbol in pairs:
                 try:
@@ -388,6 +393,7 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
                         res["symbol"]   = symbol
                         res["exchange"] = "MEXC"
                         res["net_edge"] = round(res["range_pct"] - FEE_ROUNDTRIP["MEXC"], 2)
+                        res["watched"]  = symbol in wl
                         results.append(res)
                     time.sleep(0.05)
                 except:
@@ -400,7 +406,10 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
         pairs = get_bitmart_usdt_pairs()
         if pairs:
             any_pairs = True
-            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)][:max_scan]
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)]
+            wl_p  = [p for p in pairs if p in wl]
+            rest  = [p for p in pairs if p not in wl][:max_scan]
+            pairs = wl_p + rest
             errors = 0
             for symbol in pairs:
                 try:
@@ -412,6 +421,7 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
                         res["symbol"]   = symbol
                         res["exchange"] = "BitMart"
                         res["net_edge"] = round(res["range_pct"] - FEE_ROUNDTRIP["BitMart"], 2)
+                        res["watched"]  = symbol in wl
                         results.append(res)
                     time.sleep(0.3)  # BitMart rate limit thấp
                 except:
@@ -422,7 +432,8 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
     if not any_pairs:
         return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    # watchlist lên đầu, còn lại sort theo score
+    results.sort(key=lambda x: (not x.get("watched", False), -x["score"]))
     return results[:80], None
 
 def analyze_narrative(gainers):
@@ -793,6 +804,13 @@ with tab4:
     tf_map = {"M5": 5, "M15": 15, "H1": 60}
     tf_minutes = tf_map[tf_label]
 
+    # Token ưu tiên — luôn scan, không bị cắt khỏi top pairs
+    watchlist_raw = st.text_input(
+        "📌 Token ưu tiên (luôn scan dù nằm ngoài top — cách nhau dấu phẩy)",
+        placeholder="VD: LMGX_USDT, KOMA_USDT  (MEXC thì không có gạch dưới: KOMAUSDT)",
+        key="rb_watchlist")
+    watchlist = tuple(s.strip().upper() for s in watchlist_raw.split(",") if s.strip())
+
     # Config filter
     c_cfg1, c_cfg2, c_cfg3, c_cfg4 = st.columns(4)
     with c_cfg1:
@@ -833,17 +851,17 @@ with tab4:
             range_results, scan_err = scan_range_bots(
                 max_scan=max_scan_pairs, tf_minutes=tf_minutes,
                 scan_mexc=use_mexc, scan_bitmart=use_bitmart,
-                min_range_pct=min_range_pct)
+                min_range_pct=min_range_pct, watchlist=watchlist)
 
         if scan_err:
             st.error(f"Lỗi: {scan_err}")
         elif not range_results:
             st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa hoặc giảm Oscillation tối thiểu.")
         else:
-            # Lọc theo config người dùng
+            # Lọc theo config — nhưng watchlist LUÔN qua (để theo dõi liên tục)
             filtered = [r for r in range_results
-                        if r["range_pct"] <= max_range_pct
-                        and r["oscillations"] >= min_oscillations]
+                        if r.get("watched")
+                        or (r["range_pct"] <= max_range_pct and r["oscillations"] >= min_oscillations)]
 
             buy_zone  = [r for r in filtered if "BUY"  in r["signal"]]
             sell_zone = [r for r in filtered if "SELL" in r["signal"]]
@@ -884,7 +902,8 @@ with tab4:
                     ex = item.get("exchange", "")
                     ex_badge = "badge-mexc" if ex == "MEXC" else "badge-bitmart"
                     cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {ex_badge}">{ex}</span></div>', unsafe_allow_html=True)
-                    cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{item["symbol"]}</div>', unsafe_allow_html=True)
+                    _star = "📌 " if item.get("watched") else ""
+                    cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{_star}{item["symbol"]}</div>', unsafe_allow_html=True)
                     cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{fmt_p(item["current_price"])}</div>', unsafe_allow_html=True)
                     cols[3].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.85rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
                     net = item.get("net_edge", 0)
