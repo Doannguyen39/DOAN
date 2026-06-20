@@ -259,7 +259,8 @@ def get_bitmart_klines(symbol, step=60, limit=72):
     return None
 
 # ─── ANALYZE RANGE BOT v2 (siết logic, loại false positive) ─────────────────────
-def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
+def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5, force=False):
+    # force=True (watchlist): không loại, chỉ ghi warnings filter nào fail
     highs   = kdata["highs"]
     lows    = kdata["lows"]
     closes  = kdata["closes"]
@@ -276,12 +277,16 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
     if span <= 0:
         return None
 
+    warnings = []
+
     # 1. Range trong khoảng [min_range_pct, 40%]
     range_pct = span / l_min * 100
     if range_pct > 40:
-        return None
-    if range_pct < min_range_pct:   # quá hẹp → không bù nổi phí
-        return None
+        if not force: return None
+        warnings.append("range >40%")
+    if range_pct < min_range_pct:
+        if not force: return None
+        warnings.append(f"range <{min_range_pct}%")
 
     # 2. TREND FILTER — loại token đang trend (range bot phải đi ngang)
     xs = list(range(n))
@@ -293,7 +298,8 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
     trend_move  = abs(slope) * (n - 1)
     trend_ratio = trend_move / span
     if trend_ratio > 0.4:
-        return None
+        if not force: return None
+        warnings.append("đang trend")
 
     # 3. OSCILLATION đúng nghĩa — chạm xen kẽ 2 biên
     upper_zone = l_min + span * 0.75
@@ -308,16 +314,18 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
                 touches.append(-1)
     real_osc = len(touches) - 1 if len(touches) > 1 else 0
     if real_osc < min_osc:
-        return None
+        if not force: return None
+        warnings.append(f"osc {real_osc}<{min_osc}")
 
-    # 4. VOLUME đều (CV < 0.7)
+    # 4. VOLUME đều (CV ≤ 0.85)
     vol_mean = sum(volumes) / n if volumes else 0
     if vol_mean == 0:
         return None
     vol_std = (sum((v - vol_mean) ** 2 for v in volumes) / n) ** 0.5
     vol_cv  = vol_std / vol_mean
     if vol_cv > 0.85:
-        return None
+        if not force: return None
+        warnings.append("volume loạn")
 
     # 5. NẾN đều (candle CV < 0.9)
     candle_ranges = [(highs[i] - lows[i]) / lows[i] * 100 for i in range(n) if lows[i] > 0]
@@ -325,7 +333,8 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
     candle_std = (sum((c - avg_candle) ** 2 for c in candle_ranges) / len(candle_ranges)) ** 0.5 if candle_ranges else 999
     candle_cv  = candle_std / avg_candle if avg_candle > 0 else 999
     if candle_cv > 0.9:
-        return None
+        if not force: return None
+        warnings.append("nến loạn")
 
     # SCORE
     score = 0
@@ -359,6 +368,8 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5):
         "score": round(score, 1),
         "signal": signal,
         "signal_color": signal_color,
+        "warnings": warnings,
+        "is_clean": len(warnings) == 0,
     }
 
 # ─── SCAN MULTI-SÀN (MEXC + BITMART) ────────────────────────────────────────────
@@ -388,7 +399,7 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
                     kdata = get_mexc_klines(symbol, interval=mexc_interval)
                     if not kdata:
                         continue
-                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct)
+                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct, force=(symbol in wl))
                     if res:
                         res["symbol"]   = symbol
                         res["exchange"] = "MEXC"
@@ -416,7 +427,7 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
                     kdata = get_bitmart_klines(symbol, step=tf_minutes)
                     if not kdata:
                         continue
-                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct)
+                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct, force=(symbol in wl))
                     if res:
                         res["symbol"]   = symbol
                         res["exchange"] = "BitMart"
@@ -903,7 +914,11 @@ with tab4:
                     ex_badge = "badge-mexc" if ex == "MEXC" else "badge-bitmart"
                     cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {ex_badge}">{ex}</span></div>', unsafe_allow_html=True)
                     _star = "📌 " if item.get("watched") else ""
-                    cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{_star}{item["symbol"]}</div>', unsafe_allow_html=True)
+                    _warns = item.get("warnings", [])
+                    _warn_html = ""
+                    if item.get("watched") and _warns:
+                        _warn_html = f'<div style="color:#e3b341;font-size:0.65rem;margin-top:2px;">⚠️ {", ".join(_warns)}</div>'
+                    cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{_star}{item["symbol"]}{_warn_html}</div>', unsafe_allow_html=True)
                     cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{fmt_p(item["current_price"])}</div>', unsafe_allow_html=True)
                     cols[3].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.85rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
                     net = item.get("net_edge", 0)
