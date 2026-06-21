@@ -6,6 +6,8 @@ import plotly.graph_objects as go
 from datetime import datetime
 import time
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="💎 Gem Hunter", page_icon="💎", layout="wide", initial_sidebar_state="collapsed")
 
@@ -173,6 +175,21 @@ SKIP_COINS = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH"}
 # MEXC: taker 0.05% × 2. BitMart: 0.25% × 2. Nếu đặt limit (maker) thì MEXC ~0%.
 FEE_ROUNDTRIP = {"MEXC": 0.1, "BitMart": 0.5}
 
+# Số luồng song song mỗi sàn. MEXC 300 weight/10s → 6 ok. BitMart 600 req/60s → 3 an toàn.
+# Nếu thấy lỗi 429 / rate limit, hạ 2 số này xuống.
+WORKERS_MEXC    = 6
+WORKERS_BITMART = 3
+
+def _base_asset(symbol):
+    """'BTCUSDT'->'BTC', 'BTC_USDT'->'BTC'."""
+    if symbol.endswith("_USDT"): return symbol[:-5]
+    if symbol.endswith("USDT"):  return symbol[:-4]
+    return symbol
+
+def _is_leveraged(symbol):
+    """True nếu là leveraged ETF token (…3L/3S/4L/5L…) → range giả, cần loại."""
+    return bool(re.search(r"\d+[LS]$", _base_asset(symbol)))
+
 # ─── MEXC ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def get_mexc_usdt_pairs():
@@ -189,9 +206,30 @@ def get_mexc_usdt_pairs():
         pass
     return []
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
+def get_mexc_volumes():
+    """1 call → dict {symbol: quoteVolume 24h} để xếp hạng pair theo thanh khoản."""
+    try:
+        r = requests.get(f"{MEXC_BASE}/ticker/24hr", timeout=20)
+        if r.status_code == 200:
+            out = {}
+            for t in r.json():
+                s = t.get("symbol", "")
+                if s.endswith("USDT"):
+                    try:
+                        out[s] = float(t.get("quoteVolume", 0) or 0)
+                    except (TypeError, ValueError):
+                        out[s] = 0.0
+            return out
+    except:
+        pass
+    return {}
+
 def get_mexc_klines(symbol, interval="60m", limit=72):
-    """Nến MEXC. interval dạng '60m' (H1), '15m' (M15). Data: cũ→mới."""
+    """
+    Nến MEXC. interval dạng '60m' (H1), '15m' (M15). Data: cũ→mới.
+    PLAIN function (không cache) để gọi an toàn từ nhiều thread.
+    """
     try:
         r = requests.get(f"{MEXC_BASE}/klines",
             params={"symbol": symbol, "interval": interval, "limit": limit},
@@ -225,11 +263,11 @@ def get_bitmart_usdt_pairs():
         pass
     return []
 
-@st.cache_data(ttl=60)
 def get_bitmart_klines(symbol, step=60, limit=72):
     """
     Nến BitMart spot v3. step = PHÚT (60=H1, 15=M15, 5=M5).
     Response [t,o,h,l,c,v,qv]. BitMart trả ĐẢO (mới→cũ) → sort lại cũ→mới.
+    PLAIN function (không cache) để gọi an toàn từ nhiều thread.
     """
     try:
         now = int(time.time())
@@ -372,10 +410,35 @@ def analyze_range_bot(kdata, min_osc=4, min_range_pct=0.5, force=False):
         "is_clean": len(warnings) == 0,
     }
 
+# ─── SCAN 1 SÀN (song song) ─────────────────────────────────────────────────────
+def _scan_exchange(pairs, fetch_fn, exchange_name, fee, wl, workers, min_range_pct):
+    """Quét 1 list pairs song song bằng ThreadPool. fetch_fn(symbol)->kdata|None."""
+    out = []
+    if not pairs:
+        return out
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_map = {ex.submit(fetch_fn, sym): sym for sym in pairs}
+        for fut in as_completed(fut_map):
+            sym = fut_map[fut]
+            try:
+                kdata = fut.result()
+            except Exception:
+                continue
+            if not kdata:
+                continue
+            res = analyze_range_bot(kdata, min_range_pct=min_range_pct, force=(sym in wl))
+            if res:
+                res["symbol"]   = sym
+                res["exchange"] = exchange_name
+                res["net_edge"] = round(res["range_pct"] - fee, 2)
+                res["watched"]  = sym in wl
+                out.append(res)
+    return out
+
 # ─── SCAN MULTI-SÀN (MEXC + BITMART) ────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=True, min_range_pct=0.5, watchlist=()):
-    """Quét range bot MEXC + BitMart. watchlist: token luôn scan đầu tiên, không bị cắt."""
+    """Quét range bot MEXC + BitMart (song song). watchlist: token luôn scan đầu tiên, không bị cắt."""
     results = []
     any_pairs = False
     wl = set(s.strip().upper() for s in watchlist if s.strip())
@@ -388,57 +451,29 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
         pairs = get_mexc_usdt_pairs()
         if pairs:
             any_pairs = True
-            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)]
-            # watchlist lên đầu (không bị cắt), phần còn lại giới hạn max_scan
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
+            # Xếp hạng theo volume 24h: watchlist lên đầu (không cắt), phần còn lại lấy top volume
+            vols  = get_mexc_volumes()
             wl_p  = [p for p in pairs if p in wl]
-            rest  = [p for p in pairs if p not in wl][:max_scan]
+            rest  = [p for p in pairs if p not in wl]
+            if vols:
+                rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
+            rest  = rest[:max_scan]
             pairs = wl_p + rest
-            errors = 0
-            for symbol in pairs:
-                try:
-                    kdata = get_mexc_klines(symbol, interval=mexc_interval)
-                    if not kdata:
-                        continue
-                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct, force=(symbol in wl))
-                    if res:
-                        res["symbol"]   = symbol
-                        res["exchange"] = "MEXC"
-                        res["net_edge"] = round(res["range_pct"] - FEE_ROUNDTRIP["MEXC"], 2)
-                        res["watched"]  = symbol in wl
-                        results.append(res)
-                    time.sleep(0.05)
-                except:
-                    errors += 1
-                    if errors > 30:
-                        break
+            fetch = lambda s: get_mexc_klines(s, interval=mexc_interval)
+            results += _scan_exchange(pairs, fetch, "MEXC", FEE_ROUNDTRIP["MEXC"], wl, WORKERS_MEXC, min_range_pct)
 
     # ---- BITMART ----
     if scan_bitmart:
         pairs = get_bitmart_usdt_pairs()
         if pairs:
             any_pairs = True
-            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS)]
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
             wl_p  = [p for p in pairs if p in wl]
             rest  = [p for p in pairs if p not in wl][:max_scan]
             pairs = wl_p + rest
-            errors = 0
-            for symbol in pairs:
-                try:
-                    kdata = get_bitmart_klines(symbol, step=tf_minutes)
-                    if not kdata:
-                        continue
-                    res = analyze_range_bot(kdata, min_range_pct=min_range_pct, force=(symbol in wl))
-                    if res:
-                        res["symbol"]   = symbol
-                        res["exchange"] = "BitMart"
-                        res["net_edge"] = round(res["range_pct"] - FEE_ROUNDTRIP["BitMart"], 2)
-                        res["watched"]  = symbol in wl
-                        results.append(res)
-                    time.sleep(0.3)  # BitMart rate limit thấp
-                except:
-                    errors += 1
-                    if errors > 30:
-                        break
+            fetch = lambda s: get_bitmart_klines(s, step=tf_minutes)
+            results += _scan_exchange(pairs, fetch, "BitMart", FEE_ROUNDTRIP["BitMart"], wl, WORKERS_BITMART, min_range_pct)
 
     if not any_pairs:
         return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
@@ -697,7 +732,8 @@ with tab3:
     """, unsafe_allow_html=True)
 
     if st.button("🔄 Refresh / Scan ngay", use_container_width=False):
-        st.cache_data.clear()
+        get_top_gainers_cmc.clear()   # CHỈ xóa cache narrative, không đụng CG/Range
+        get_gems_by_tags.clear()
         st.rerun()
 
     if not CMC_KEY:
@@ -798,7 +834,7 @@ with tab4:
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
         <div style="font-weight:600;color:#e6edf3;">🤖 Range Bot Scanner</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
-            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + BitMart Spot · Cache 5 phút
+            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + BitMart Spot · Scan song song · Cache 5 phút
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -835,7 +871,7 @@ with tab4:
             help="Số lần giá chuyển xen kẽ giữa biên trên và biên dưới")
     with c_cfg4:
         max_scan_pairs = st.slider("Số pairs scan / sàn", 100, 500, 300, 50,
-            help="Nhiều hơn = chậm hơn")
+            help="Quét top N pair theo volume 24h (MEXC). Nhiều hơn = chậm hơn")
 
     if min_range_pct >= max_range_pct:
         st.warning(f"⚠️ Range tối thiểu ({min_range_pct}%) ≥ tối đa ({max_range_pct}%) → sẽ không ra token. Giảm tối thiểu hoặc tăng tối đa.")
@@ -846,28 +882,33 @@ with tab4:
     with col_btn:
         scan_btn = st.button("🔄 Scan ngay", use_container_width=True, key="range_scan_btn")
     with col_info:
-        est = ""
-        if use_bitmart:
-            est = " · BitMart rate limit thấp nên chậm hơn (~2-3 phút)"
-        st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Quét theo từng sàn đã chọn · Cache 5 phút{est}</div>', unsafe_allow_html=True)
+        est = " · BitMart hơi chậm hơn MEXC" if use_bitmart else ""
+        st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Scan song song (~20-40s) · Cache 5 phút · Chỉ chạy khi bấm{est}</div>', unsafe_allow_html=True)
 
-    if scan_btn:
-        st.cache_data.clear()
-
-    if not use_mexc and not use_bitmart:
-        st.warning("⚠️ Chọn ít nhất 1 sàn để scan.")
-    else:
-        ex_txt = " + ".join([x for x, on in [("MEXC", use_mexc), ("BitMart", use_bitmart)] if on])
-        with st.spinner(f"🔍 Đang scan {ex_txt} · {tf_label}..."):
-            range_results, scan_err = scan_range_bots(
+    # Scan CHỈ chạy khi bấm nút → lưu kết quả vào session (không tự scan mỗi lần mở app/đổi filter)
+    if scan_btn and (use_mexc or use_bitmart):
+        scan_range_bots.clear()  # CHỈ xóa cache scan này, không nuke CG/CMC
+        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('BitMart',use_bitmart)] if on])} · {tf_label}..."):
+            res, err = scan_range_bots(
                 max_scan=max_scan_pairs, tf_minutes=tf_minutes,
                 scan_mexc=use_mexc, scan_bitmart=use_bitmart,
                 min_range_pct=min_range_pct, watchlist=watchlist)
+        st.session_state["rb_results"] = res
+        st.session_state["rb_err"] = err
+        st.session_state["rb_loaded"] = True
+
+    if not use_mexc and not use_bitmart:
+        st.warning("⚠️ Chọn ít nhất 1 sàn để scan.")
+    elif not st.session_state.get("rb_loaded"):
+        st.info("Bấm **Scan ngay** để quét MEXC/BitMart. (Scan chỉ chạy khi bấm — không tự chạy mỗi lần mở app hay đổi filter.)")
+    else:
+        range_results = st.session_state.get("rb_results", [])
+        scan_err      = st.session_state.get("rb_err")
 
         if scan_err:
             st.error(f"Lỗi: {scan_err}")
         elif not range_results:
-            st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa hoặc giảm Oscillation tối thiểu.")
+            st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa hoặc giảm Oscillation tối thiểu rồi Scan lại.")
         else:
             # Lọc theo config — nhưng watchlist LUÔN qua (để theo dõi liên tục)
             filtered = [r for r in range_results
