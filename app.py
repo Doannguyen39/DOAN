@@ -39,7 +39,7 @@ html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .badge-red{background:#2d1212;color:#f85149;}
 .badge-yellow{background:#2d2208;color:#e3b341;}
 .badge-mexc{background:#1a2433;color:#58a6ff;}
-.badge-bybit{background:#241a37;color:#f7a600;}
+.badge-gate{background:#0d2b2b;color:#2dd4bf;}
 .gem-row{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin-bottom:6px;}
 .gem-row:hover{border-color:#58a6ff;}
 .warning{background:#2d1a00;border:1px solid #d29922;border-radius:10px;padding:12px 16px;font-size:0.82rem;color:#e3b341;margin-top:12px;}
@@ -164,32 +164,37 @@ def get_gems_by_tags(search_tags):
     return []
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RANGE BOT SCANNER — DATA SOURCE: MEXC + BYBIT
+# RANGE BOT SCANNER — DATA SOURCE: MEXC + GATE.IO
 # ═══════════════════════════════════════════════════════════════════════════════
 MEXC_BASE  = "https://api.mexc.com/api/v3"
-BYBIT_BASE = "https://api.bybit.com"
+GATE_BASE  = "https://api.gateio.ws/api/v4"
 
 SKIP_COINS = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH"}
 
 # Phí round-trip (mua + bán) theo sàn, % — dùng taker chuẩn (an toàn)
-# MEXC: taker 0.05% × 2. Bybit spot: taker 0.1% × 2 (mặc định, KHÔNG có VIP/BNB discount).
-# ⚠️ Đây là số THAM KHẢO — Kevin cần tự verify lại theo tier phí thật của tài khoản trước khi tin cột Net%.
-FEE_ROUNDTRIP = {"MEXC": 0.1, "Bybit": 0.2}
+# MEXC: taker 0.05% × 2 = 0.1%. Gate spot: taker 0.2% × 2 = 0.4% (theo field "fee":"0.2" trong currency_pairs).
+# ⚠️ Đây là số THAM KHẢO — Kevin cần tự verify lại theo tier phí thật (GT/VIP có discount) trước khi tin cột Net%.
+FEE_ROUNDTRIP = {"MEXC": 0.1, "Gate": 0.4}
 
 # Số luồng song song mỗi sàn. MEXC 300 weight/10s → 6 ok.
-# Bybit public market data rate limit thường thoáng hơn BitMart, nhưng set khởi điểm thận trọng.
+# Gate public market data rate limit ~200 req/10s → 5 an toàn.
 # ⚠️ Nếu thấy lỗi 429 / rate limit khi scan thật, hạ số này xuống và báo lại.
 WORKERS_MEXC  = 6
-WORKERS_BYBIT = 5
+WORKERS_GATE  = 5
 
 def _base_asset(symbol):
-    """'BTCUSDT'->'BTC' (MEXC và Bybit đều dùng dạng liền, không gạch dưới)."""
+    """'BTCUSDT'->'BTC' (MEXC dạng liền). 'BTC_USDT'->'BTC' (Gate dạng gạch dưới)."""
+    if "_" in symbol: return symbol.split("_")[0]
     if symbol.endswith("USDT"): return symbol[:-4]
     return symbol
 
 def _is_leveraged(symbol):
     """True nếu là leveraged ETF token (…3L/3S/4L/5L…) → range giả, cần loại."""
     return bool(re.search(r"\d+[LS]$", _base_asset(symbol)))
+
+def _wl_hit(symbol, wl):
+    """Match watchlist bỏ qua gạch dưới: 'KOMA_USDT' (Gate) hay 'KOMAUSDT' (MEXC) đều khớp 'KOMAUSDT'."""
+    return symbol.replace("_", "").upper() in wl
 
 # ─── MEXC ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
@@ -248,41 +253,32 @@ def get_mexc_klines(symbol, interval="60m", limit=72):
         pass
     return None
 
-# ─── BYBIT ────────────────────────────────────────────────────────────────────
+# ─── GATE.IO ──────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def get_bybit_usdt_pairs():
-    """Spot pairs USDT trên Bybit. Symbol dạng 'BTCUSDT' (giống MEXC, không gạch dưới)."""
+def get_gate_usdt_pairs():
+    """Spot pairs USDT trên Gate.io. Symbol dạng 'BTC_USDT' (CÓ gạch dưới). ~2000+ pair."""
     try:
-        r = requests.get(f"{BYBIT_BASE}/v5/market/instruments-info",
-            params={"category": "spot"}, timeout=15)
+        r = requests.get(f"{GATE_BASE}/spot/currency_pairs", timeout=20)
         if r.status_code == 200:
-            j = r.json()
-            if j.get("retCode") != 0:
-                return []
-            items = j.get("result", {}).get("list", [])
-            return [s["symbol"] for s in items
-                    if s.get("quoteCoin") == "USDT"
-                    and s.get("status") == "Trading"]
+            return [s["id"] for s in r.json()
+                    if s.get("quote") == "USDT"
+                    and s.get("trade_status") == "tradable"]
     except:
         pass
     return []
 
 @st.cache_data(ttl=300)
-def get_bybit_volumes():
-    """1 call → dict {symbol: turnover24h} để xếp hạng pair theo thanh khoản."""
+def get_gate_volumes():
+    """1 call → dict {symbol: quote_volume 24h} để xếp hạng pair theo thanh khoản."""
     try:
-        r = requests.get(f"{BYBIT_BASE}/v5/market/tickers",
-            params={"category": "spot"}, timeout=20)
+        r = requests.get(f"{GATE_BASE}/spot/tickers", timeout=20)
         if r.status_code == 200:
-            j = r.json()
-            if j.get("retCode") != 0:
-                return {}
             out = {}
-            for t in j.get("result", {}).get("list", []):
-                s = t.get("symbol", "")
-                if s.endswith("USDT"):
+            for t in r.json():
+                s = t.get("currency_pair", "")
+                if s.endswith("_USDT"):
                     try:
-                        out[s] = float(t.get("turnover24h", 0) or 0)
+                        out[s] = float(t.get("quote_volume", 0) or 0)
                     except (TypeError, ValueError):
                         out[s] = 0.0
             return out
@@ -290,29 +286,25 @@ def get_bybit_volumes():
         pass
     return {}
 
-def get_bybit_klines(symbol, interval="15", limit=72):
+def get_gate_klines(symbol, interval="15m", limit=72):
     """
-    Nến Bybit v5 spot. interval = PHÚT dạng chuỗi thuần: '5','15','60' (khác MEXC '5m'/'60m').
-    Response trả mới→cũ → sort lại cũ→mới.
+    Nến Gate.io v4 spot. interval dạng '5m','15m','1h' (H1 = '1h', KHÔNG phải '60m' như MEXC).
+    ⚠️ Cột Gate KHÁC MEXC/Bybit: [ts, quote_vol, CLOSE, HIGH, LOW, OPEN, base_vol, closed]. Data cũ→mới.
     PLAIN function (không cache) để gọi an toàn từ nhiều thread.
     """
     try:
-        r = requests.get(f"{BYBIT_BASE}/v5/market/kline",
-            params={"category": "spot", "symbol": symbol, "interval": interval, "limit": limit},
+        r = requests.get(f"{GATE_BASE}/spot/candlesticks",
+            params={"currency_pair": symbol, "interval": interval, "limit": limit},
             timeout=8)
         if r.status_code == 200:
-            j = r.json()
-            if j.get("retCode") != 0:
-                return None
-            data = j.get("result", {}).get("list", [])
+            data = r.json()
             if not data or len(data) < 20:
                 return None
-            # Bybit trả [startTime, open, high, low, close, volume, turnover], mới→cũ
             data = sorted(data, key=lambda c: int(c[0]))  # cũ → mới
-            highs   = [float(c[2]) for c in data]
-            lows    = [float(c[3]) for c in data]
-            closes  = [float(c[4]) for c in data]
-            volumes = [float(c[5]) for c in data]
+            highs   = [float(c[3]) for c in data]   # HIGH  = cột 3
+            lows    = [float(c[4]) for c in data]   # LOW   = cột 4
+            closes  = [float(c[2]) for c in data]   # CLOSE = cột 2
+            volumes = [float(c[1]) for c in data]   # quote volume = cột 1 (luôn có)
             return {"highs": highs, "lows": lows, "closes": closes, "volumes": volumes}
     except:
         pass
@@ -448,31 +440,31 @@ def _scan_exchange(pairs, fetch_fn, exchange_name, fee, wl, workers, min_range_p
                 continue
             if not kdata:
                 continue
-            res = analyze_range_bot(kdata, min_range_pct=min_range_pct, force=(sym in wl))
+            res = analyze_range_bot(kdata, min_range_pct=min_range_pct, force=_wl_hit(sym, wl))
             if res:
                 res["symbol"]   = sym
                 res["exchange"] = exchange_name
                 res["net_edge"] = round(res["range_pct"] - fee, 2)
-                res["watched"]  = sym in wl
+                res["watched"]  = _wl_hit(sym, wl)
                 out.append(res)
     return out
 
-# ─── SCAN MULTI-SÀN (MEXC + BYBIT) ──────────────────────────────────────────────
+# ─── SCAN MULTI-SÀN (MEXC + GATE.IO) ────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def scan_range_bots(rank_start=100, rank_end=600, tf_minutes=60, scan_mexc=True, scan_bybit=True, min_range_pct=0.5, watchlist=()):
+def scan_range_bots(rank_start=100, rank_end=600, tf_minutes=60, scan_mexc=True, scan_gate=True, min_range_pct=0.5, watchlist=()):
     """
-    Quét range bot MEXC + Bybit (song song).
+    Quét range bot MEXC + Gate.io (song song).
     Chọn pair theo DẢI HẠNG volume [rank_start:rank_end] — né top (coin lớn không có range bot),
     nhắm vùng lowcap để tìm mô hình sideway. watchlist luôn scan đầu tiên, không bị cắt.
     """
     results = []
     any_pairs = False
-    wl = set(s.strip().upper() for s in watchlist if s.strip())
+    wl = set(s.strip().upper().replace("_", "") for s in watchlist if s.strip())
 
-    # MEXC interval string theo phút
+    # MEXC interval string theo phút ('60m' cho H1)
     mexc_interval = f"{tf_minutes}m" if tf_minutes < 60 else "60m" if tf_minutes == 60 else "4h"
-    # Bybit interval string: phút thuần, không có hậu tố 'm'
-    bybit_interval = str(tf_minutes)
+    # Gate interval string: '5m'/'15m'/'1h' (H1 = '1h', KHÁC MEXC dùng '60m')
+    gate_interval = f"{tf_minutes}m" if tf_minutes < 60 else "1h" if tf_minutes == 60 else "4h"
 
     # ---- MEXC ----
     if scan_mexc:
@@ -482,8 +474,8 @@ def scan_range_bots(rank_start=100, rank_end=600, tf_minutes=60, scan_mexc=True,
             pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
             # Xếp hạng theo volume 24h: watchlist lên đầu (không cắt), phần còn lại lấy DẢI HẠNG lowcap
             vols  = get_mexc_volumes()
-            wl_p  = [p for p in pairs if p in wl]
-            rest  = [p for p in pairs if p not in wl]
+            wl_p  = [p for p in pairs if _wl_hit(p, wl)]
+            rest  = [p for p in pairs if not _wl_hit(p, wl)]
             if vols:
                 rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
             rest  = rest[rank_start:rank_end]
@@ -491,21 +483,21 @@ def scan_range_bots(rank_start=100, rank_end=600, tf_minutes=60, scan_mexc=True,
             fetch = lambda s: get_mexc_klines(s, interval=mexc_interval)
             results += _scan_exchange(pairs, fetch, "MEXC", FEE_ROUNDTRIP["MEXC"], wl, WORKERS_MEXC, min_range_pct)
 
-    # ---- BYBIT ----
-    if scan_bybit:
-        pairs = get_bybit_usdt_pairs()
+    # ---- GATE.IO ----
+    if scan_gate:
+        pairs = get_gate_usdt_pairs()
         if pairs:
             any_pairs = True
             pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
-            vols  = get_bybit_volumes()
-            wl_p  = [p for p in pairs if p in wl]
-            rest  = [p for p in pairs if p not in wl]
+            vols  = get_gate_volumes()
+            wl_p  = [p for p in pairs if _wl_hit(p, wl)]
+            rest  = [p for p in pairs if not _wl_hit(p, wl)]
             if vols:
                 rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
             rest  = rest[rank_start:rank_end]
             pairs = wl_p + rest
-            fetch = lambda s: get_bybit_klines(s, interval=bybit_interval)
-            results += _scan_exchange(pairs, fetch, "Bybit", FEE_ROUNDTRIP["Bybit"], wl, WORKERS_BYBIT, min_range_pct)
+            fetch = lambda s: get_gate_klines(s, interval=gate_interval)
+            results += _scan_exchange(pairs, fetch, "Gate", FEE_ROUNDTRIP["Gate"], wl, WORKERS_GATE, min_range_pct)
 
     if not any_pairs:
         return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
@@ -866,7 +858,7 @@ with tab4:
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
         <div style="font-weight:600;color:#e6edf3;">🤖 Range Bot Scanner</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
-            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + Bybit Spot · Scan song song · Cache 5 phút
+            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + Gate Spot · Scan song song · Cache 5 phút
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -876,7 +868,7 @@ with tab4:
     with c_ex1:
         use_mexc = st.checkbox("MEXC", value=True, key="rb_mexc")
     with c_ex2:
-        use_bybit = st.checkbox("Bybit", value=True, key="rb_bybit")
+        use_gate = st.checkbox("Gate.io", value=True, key="rb_gate")
     with c_tf:
         tf_label = st.selectbox("Khung thời gian", ["M5", "M15", "H1"], index=1, key="rb_tf",
             help="Range bot thấy rõ nhất ở M15")
@@ -886,7 +878,7 @@ with tab4:
     # Token ưu tiên — luôn scan, không bị cắt khỏi top pairs
     watchlist_raw = st.text_input(
         "📌 Token ưu tiên (luôn scan dù nằm ngoài top — cách nhau dấu phẩy)",
-        placeholder="VD: KOMAUSDT, LMGXUSDT  (MEXC và Bybit đều dùng dạng liền, không gạch dưới)",
+        placeholder="VD: KOMAUSDT, LMGXUSDT  (gõ liền hay có gạch dưới đều được — tự khớp cả MEXC lẫn Gate)",
         key="rb_watchlist")
     watchlist = tuple(s.strip().upper() for s in watchlist_raw.split(",") if s.strip())
 
@@ -909,31 +901,31 @@ with tab4:
     if min_range_pct >= max_range_pct:
         st.warning(f"⚠️ Range tối thiểu ({min_range_pct}%) ≥ tối đa ({max_range_pct}%) → sẽ không ra token. Giảm tối thiểu hoặc tăng tối đa.")
 
-    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Né top coin (thanh khoản cao = coin lớn, đi trend) → quét dải hạng lowcap tìm mô hình sideway ổn định. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · Bybit ~0.2% — số tham khảo, tự verify lại theo tier phí thật) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
+    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Né top coin (thanh khoản cao = coin lớn, đi trend) → quét dải hạng lowcap tìm mô hình sideway ổn định. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · Gate ~0.4% — số tham khảo, tự verify lại theo tier phí thật) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
         scan_btn = st.button("🔄 Scan ngay", use_container_width=True, key="range_scan_btn")
     with col_info:
-        est = " · Bybit tốc độ tương đương MEXC" if use_bybit else ""
+        est = " · Gate ~2000+ pair, quét lâu hơn chút" if use_gate else ""
         st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Scan song song (~20-40s) · Cache 5 phút · Chỉ chạy khi bấm{est}</div>', unsafe_allow_html=True)
 
     # Scan CHỈ chạy khi bấm nút → lưu kết quả vào session (không tự scan mỗi lần mở app/đổi filter)
-    if scan_btn and (use_mexc or use_bybit):
+    if scan_btn and (use_mexc or use_gate):
         scan_range_bots.clear()  # CHỈ xóa cache scan này, không nuke CG/CMC
-        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('Bybit',use_bybit)] if on])} · {tf_label} · hạng {rank_start}–{rank_end}..."):
+        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('Gate',use_gate)] if on])} · {tf_label} · hạng {rank_start}–{rank_end}..."):
             res, err = scan_range_bots(
                 rank_start=rank_start, rank_end=rank_end, tf_minutes=tf_minutes,
-                scan_mexc=use_mexc, scan_bybit=use_bybit,
+                scan_mexc=use_mexc, scan_gate=use_gate,
                 min_range_pct=min_range_pct, watchlist=watchlist)
         st.session_state["rb_results"] = res
         st.session_state["rb_err"] = err
         st.session_state["rb_loaded"] = True
 
-    if not use_mexc and not use_bybit:
+    if not use_mexc and not use_gate:
         st.warning("⚠️ Chọn ít nhất 1 sàn để scan.")
     elif not st.session_state.get("rb_loaded"):
-        st.info("Bấm **Scan ngay** để quét MEXC/Bybit. (Scan chỉ chạy khi bấm — không tự chạy mỗi lần mở app hay đổi filter.)")
+        st.info("Bấm **Scan ngay** để quét MEXC/Gate. (Scan chỉ chạy khi bấm — không tự chạy mỗi lần mở app hay đổi filter.)")
     else:
         range_results = st.session_state.get("rb_results", [])
         scan_err      = st.session_state.get("rb_err")
@@ -985,7 +977,7 @@ with tab4:
                 for item in display:
                     cols = st.columns([1, 1.7, 1, 1, 1, 1.1, 1.1, 1.3, 1])
                     ex = item.get("exchange", "")
-                    ex_badge = "badge-mexc" if ex == "MEXC" else "badge-bybit"
+                    ex_badge = "badge-mexc" if ex == "MEXC" else "badge-gate"
                     cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {ex_badge}">{ex}</span></div>', unsafe_allow_html=True)
                     _star = "📌 " if item.get("watched") else ""
                     _warns = item.get("warnings", [])
@@ -1014,4 +1006,4 @@ with tab4:
 
                 st.markdown('<div class="warning">⚠️ Net% = range trừ phí round-trip (đã ăn được nguyên range — thực tế còn ít hơn). Net dương chỉ là điều kiện CẦN. Bot có thể dừng bất kỳ lúc nào → giá dump. Luôn đặt SL chặt ngoài range.</div>', unsafe_allow_html=True)
 
-st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC + Bybit · Research only</div>', unsafe_allow_html=True)
+st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC + Gate.io · Research only</div>', unsafe_allow_html=True)
