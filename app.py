@@ -459,8 +459,12 @@ def _scan_exchange(pairs, fetch_fn, exchange_name, fee, wl, workers, min_range_p
 
 # ─── SCAN MULTI-SÀN (MEXC + BYBIT) ──────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bybit=True, min_range_pct=0.5, watchlist=()):
-    """Quét range bot MEXC + Bybit (song song). watchlist: token luôn scan đầu tiên, không bị cắt."""
+def scan_range_bots(rank_start=100, rank_end=600, tf_minutes=60, scan_mexc=True, scan_bybit=True, min_range_pct=0.5, watchlist=()):
+    """
+    Quét range bot MEXC + Bybit (song song).
+    Chọn pair theo DẢI HẠNG volume [rank_start:rank_end] — né top (coin lớn không có range bot),
+    nhắm vùng lowcap để tìm mô hình sideway. watchlist luôn scan đầu tiên, không bị cắt.
+    """
     results = []
     any_pairs = False
     wl = set(s.strip().upper() for s in watchlist if s.strip())
@@ -476,13 +480,13 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bybit=True
         if pairs:
             any_pairs = True
             pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
-            # Xếp hạng theo volume 24h: watchlist lên đầu (không cắt), phần còn lại lấy top volume
+            # Xếp hạng theo volume 24h: watchlist lên đầu (không cắt), phần còn lại lấy DẢI HẠNG lowcap
             vols  = get_mexc_volumes()
             wl_p  = [p for p in pairs if p in wl]
             rest  = [p for p in pairs if p not in wl]
             if vols:
                 rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
-            rest  = rest[:max_scan]
+            rest  = rest[rank_start:rank_end]
             pairs = wl_p + rest
             fetch = lambda s: get_mexc_klines(s, interval=mexc_interval)
             results += _scan_exchange(pairs, fetch, "MEXC", FEE_ROUNDTRIP["MEXC"], wl, WORKERS_MEXC, min_range_pct)
@@ -498,7 +502,7 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bybit=True
             rest  = [p for p in pairs if p not in wl]
             if vols:
                 rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
-            rest  = rest[:max_scan]
+            rest  = rest[rank_start:rank_end]
             pairs = wl_p + rest
             fetch = lambda s: get_bybit_klines(s, interval=bybit_interval)
             results += _scan_exchange(pairs, fetch, "Bybit", FEE_ROUNDTRIP["Bybit"], wl, WORKERS_BYBIT, min_range_pct)
@@ -898,13 +902,14 @@ with tab4:
         min_oscillations = st.slider("Oscillation tối thiểu", 2, 15, 4, 1,
             help="Số lần giá chuyển xen kẽ giữa biên trên và biên dưới")
     with c_cfg4:
-        max_scan_pairs = st.slider("Số pairs scan / sàn", 100, 500, 300, 50,
-            help="Quét top N pair theo volume 24h. Nhiều hơn = chậm hơn")
+        rank_band = st.slider("Dải hạng volume (né top)", 0, 1500, (100, 600), 50,
+            help="Bỏ N coin top đầu (volume cao = coin lớn, không có range bot) → quét dải lowcap. Mặc định hạng 100–600. Muốn moi sâu hơn kéo phải.")
+        rank_start, rank_end = rank_band
 
     if min_range_pct >= max_range_pct:
         st.warning(f"⚠️ Range tối thiểu ({min_range_pct}%) ≥ tối đa ({max_range_pct}%) → sẽ không ra token. Giảm tối thiểu hoặc tăng tối đa.")
 
-    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Range rộng = ăn đậm mỗi cú nhưng SỐ token ít hơn nhiều. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · Bybit ~0.2% — số tham khảo, tự verify lại theo tier phí thật) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
+    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Né top coin (thanh khoản cao = coin lớn, đi trend) → quét dải hạng lowcap tìm mô hình sideway ổn định. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · Bybit ~0.2% — số tham khảo, tự verify lại theo tier phí thật) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
@@ -916,9 +921,9 @@ with tab4:
     # Scan CHỈ chạy khi bấm nút → lưu kết quả vào session (không tự scan mỗi lần mở app/đổi filter)
     if scan_btn and (use_mexc or use_bybit):
         scan_range_bots.clear()  # CHỈ xóa cache scan này, không nuke CG/CMC
-        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('Bybit',use_bybit)] if on])} · {tf_label}..."):
+        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('Bybit',use_bybit)] if on])} · {tf_label} · hạng {rank_start}–{rank_end}..."):
             res, err = scan_range_bots(
-                max_scan=max_scan_pairs, tf_minutes=tf_minutes,
+                rank_start=rank_start, rank_end=rank_end, tf_minutes=tf_minutes,
                 scan_mexc=use_mexc, scan_bybit=use_bybit,
                 min_range_pct=min_range_pct, watchlist=watchlist)
         st.session_state["rb_results"] = res
@@ -936,7 +941,7 @@ with tab4:
         if scan_err:
             st.error(f"Lỗi: {scan_err}")
         elif not range_results:
-            st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa hoặc giảm Oscillation tối thiểu rồi Scan lại.")
+            st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa, giảm Oscillation tối thiểu, hoặc mở rộng dải hạng volume rồi Scan lại.")
         else:
             # Lọc theo config — nhưng watchlist LUÔN qua (để theo dõi liên tục)
             filtered = [r for r in range_results
