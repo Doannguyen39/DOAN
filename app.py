@@ -39,7 +39,7 @@ html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .badge-red{background:#2d1212;color:#f85149;}
 .badge-yellow{background:#2d2208;color:#e3b341;}
 .badge-mexc{background:#1a2433;color:#58a6ff;}
-.badge-bitmart{background:#2a1e37;color:#a371f7;}
+.badge-bybit{background:#241a37;color:#f7a600;}
 .gem-row{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin-bottom:6px;}
 .gem-row:hover{border-color:#58a6ff;}
 .warning{background:#2d1a00;border:1px solid #d29922;border-radius:10px;padding:12px 16px;font-size:0.82rem;color:#e3b341;margin-top:12px;}
@@ -164,26 +164,27 @@ def get_gems_by_tags(search_tags):
     return []
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RANGE BOT SCANNER — DATA SOURCE: MEXC + BITMART
+# RANGE BOT SCANNER — DATA SOURCE: MEXC + BYBIT
 # ═══════════════════════════════════════════════════════════════════════════════
-MEXC_BASE    = "https://api.mexc.com/api/v3"
-BITMART_BASE = "https://api-cloud.bitmart.com"
+MEXC_BASE  = "https://api.mexc.com/api/v3"
+BYBIT_BASE = "https://api.bybit.com"
 
 SKIP_COINS = {"USDC","BUSD","USDD","TUSD","FDUSD","DAI","WBTC","WETH","STETH"}
 
 # Phí round-trip (mua + bán) theo sàn, % — dùng taker chuẩn (an toàn)
-# MEXC: taker 0.05% × 2. BitMart: 0.25% × 2. Nếu đặt limit (maker) thì MEXC ~0%.
-FEE_ROUNDTRIP = {"MEXC": 0.1, "BitMart": 0.5}
+# MEXC: taker 0.05% × 2. Bybit spot: taker 0.1% × 2 (mặc định, KHÔNG có VIP/BNB discount).
+# ⚠️ Đây là số THAM KHẢO — Kevin cần tự verify lại theo tier phí thật của tài khoản trước khi tin cột Net%.
+FEE_ROUNDTRIP = {"MEXC": 0.1, "Bybit": 0.2}
 
-# Số luồng song song mỗi sàn. MEXC 300 weight/10s → 6 ok. BitMart 600 req/60s → 3 an toàn.
-# Nếu thấy lỗi 429 / rate limit, hạ 2 số này xuống.
-WORKERS_MEXC    = 6
-WORKERS_BITMART = 3
+# Số luồng song song mỗi sàn. MEXC 300 weight/10s → 6 ok.
+# Bybit public market data rate limit thường thoáng hơn BitMart, nhưng set khởi điểm thận trọng.
+# ⚠️ Nếu thấy lỗi 429 / rate limit khi scan thật, hạ số này xuống và báo lại.
+WORKERS_MEXC  = 6
+WORKERS_BYBIT = 5
 
 def _base_asset(symbol):
-    """'BTCUSDT'->'BTC', 'BTC_USDT'->'BTC'."""
-    if symbol.endswith("_USDT"): return symbol[:-5]
-    if symbol.endswith("USDT"):  return symbol[:-4]
+    """'BTCUSDT'->'BTC' (MEXC và Bybit đều dùng dạng liền, không gạch dưới)."""
+    if symbol.endswith("USDT"): return symbol[:-4]
     return symbol
 
 def _is_leveraged(symbol):
@@ -247,46 +248,67 @@ def get_mexc_klines(symbol, interval="60m", limit=72):
         pass
     return None
 
-# ─── BITMART ──────────────────────────────────────────────────────────────────
+# ─── BYBIT ────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def get_bitmart_usdt_pairs():
-    """Spot pairs USDT trên BitMart. Symbol dạng 'BTC_USDT'."""
+def get_bybit_usdt_pairs():
+    """Spot pairs USDT trên Bybit. Symbol dạng 'BTCUSDT' (giống MEXC, không gạch dưới)."""
     try:
-        r = requests.get(f"{BITMART_BASE}/spot/v1/symbols", timeout=15)
+        r = requests.get(f"{BYBIT_BASE}/v5/market/instruments-info",
+            params={"category": "spot"}, timeout=15)
         if r.status_code == 200:
             j = r.json()
-            if j.get("code") != 1000:
+            if j.get("retCode") != 0:
                 return []
-            syms = j.get("data", {}).get("symbols", [])
-            return [s for s in syms if s.endswith("_USDT")]
+            items = j.get("result", {}).get("list", [])
+            return [s["symbol"] for s in items
+                    if s.get("quoteCoin") == "USDT"
+                    and s.get("status") == "Trading"]
     except:
         pass
     return []
 
-def get_bitmart_klines(symbol, step=60, limit=72):
+@st.cache_data(ttl=300)
+def get_bybit_volumes():
+    """1 call → dict {symbol: turnover24h} để xếp hạng pair theo thanh khoản."""
+    try:
+        r = requests.get(f"{BYBIT_BASE}/v5/market/tickers",
+            params={"category": "spot"}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("retCode") != 0:
+                return {}
+            out = {}
+            for t in j.get("result", {}).get("list", []):
+                s = t.get("symbol", "")
+                if s.endswith("USDT"):
+                    try:
+                        out[s] = float(t.get("turnover24h", 0) or 0)
+                    except (TypeError, ValueError):
+                        out[s] = 0.0
+            return out
+    except:
+        pass
+    return {}
+
+def get_bybit_klines(symbol, interval="15", limit=72):
     """
-    Nến BitMart spot v3. step = PHÚT (60=H1, 15=M15, 5=M5).
-    Response [t,o,h,l,c,v,qv]. BitMart trả ĐẢO (mới→cũ) → sort lại cũ→mới.
+    Nến Bybit v5 spot. interval = PHÚT dạng chuỗi thuần: '5','15','60' (khác MEXC '5m'/'60m').
+    Response trả mới→cũ → sort lại cũ→mới.
     PLAIN function (không cache) để gọi an toàn từ nhiều thread.
     """
     try:
-        now = int(time.time())
-        params = {
-            "symbol": symbol,
-            "step": step,
-            "after": now - (limit + 1) * step * 60,
-            "before": now,
-        }
-        r = requests.get(f"{BITMART_BASE}/spot/quotation/v3/klines",
-                         params=params, timeout=8)
+        r = requests.get(f"{BYBIT_BASE}/v5/market/kline",
+            params={"category": "spot", "symbol": symbol, "interval": interval, "limit": limit},
+            timeout=8)
         if r.status_code == 200:
             j = r.json()
-            if j.get("code") != 1000:
+            if j.get("retCode") != 0:
                 return None
-            data = j.get("data", [])
+            data = j.get("result", {}).get("list", [])
             if not data or len(data) < 20:
                 return None
-            data = sorted(data, key=lambda c: float(c[0]))  # cũ → mới
+            # Bybit trả [startTime, open, high, low, close, volume, turnover], mới→cũ
+            data = sorted(data, key=lambda c: int(c[0]))  # cũ → mới
             highs   = [float(c[2]) for c in data]
             lows    = [float(c[3]) for c in data]
             closes  = [float(c[4]) for c in data]
@@ -435,16 +457,18 @@ def _scan_exchange(pairs, fetch_fn, exchange_name, fee, wl, workers, min_range_p
                 out.append(res)
     return out
 
-# ─── SCAN MULTI-SÀN (MEXC + BITMART) ────────────────────────────────────────────
+# ─── SCAN MULTI-SÀN (MEXC + BYBIT) ──────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=True, min_range_pct=0.5, watchlist=()):
-    """Quét range bot MEXC + BitMart (song song). watchlist: token luôn scan đầu tiên, không bị cắt."""
+def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bybit=True, min_range_pct=0.5, watchlist=()):
+    """Quét range bot MEXC + Bybit (song song). watchlist: token luôn scan đầu tiên, không bị cắt."""
     results = []
     any_pairs = False
     wl = set(s.strip().upper() for s in watchlist if s.strip())
 
     # MEXC interval string theo phút
     mexc_interval = f"{tf_minutes}m" if tf_minutes < 60 else "60m" if tf_minutes == 60 else "4h"
+    # Bybit interval string: phút thuần, không có hậu tố 'm'
+    bybit_interval = str(tf_minutes)
 
     # ---- MEXC ----
     if scan_mexc:
@@ -463,17 +487,21 @@ def scan_range_bots(max_scan=300, tf_minutes=60, scan_mexc=True, scan_bitmart=Tr
             fetch = lambda s: get_mexc_klines(s, interval=mexc_interval)
             results += _scan_exchange(pairs, fetch, "MEXC", FEE_ROUNDTRIP["MEXC"], wl, WORKERS_MEXC, min_range_pct)
 
-    # ---- BITMART ----
-    if scan_bitmart:
-        pairs = get_bitmart_usdt_pairs()
+    # ---- BYBIT ----
+    if scan_bybit:
+        pairs = get_bybit_usdt_pairs()
         if pairs:
             any_pairs = True
             pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
+            vols  = get_bybit_volumes()
             wl_p  = [p for p in pairs if p in wl]
-            rest  = [p for p in pairs if p not in wl][:max_scan]
+            rest  = [p for p in pairs if p not in wl]
+            if vols:
+                rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
+            rest  = rest[:max_scan]
             pairs = wl_p + rest
-            fetch = lambda s: get_bitmart_klines(s, step=tf_minutes)
-            results += _scan_exchange(pairs, fetch, "BitMart", FEE_ROUNDTRIP["BitMart"], wl, WORKERS_BITMART, min_range_pct)
+            fetch = lambda s: get_bybit_klines(s, interval=bybit_interval)
+            results += _scan_exchange(pairs, fetch, "Bybit", FEE_ROUNDTRIP["Bybit"], wl, WORKERS_BYBIT, min_range_pct)
 
     if not any_pairs:
         return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
@@ -834,7 +862,7 @@ with tab4:
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
         <div style="font-weight:600;color:#e6edf3;">🤖 Range Bot Scanner</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
-            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + BitMart Spot · Scan song song · Cache 5 phút
+            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + Bybit Spot · Scan song song · Cache 5 phút
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -844,7 +872,7 @@ with tab4:
     with c_ex1:
         use_mexc = st.checkbox("MEXC", value=True, key="rb_mexc")
     with c_ex2:
-        use_bitmart = st.checkbox("BitMart", value=True, key="rb_bitmart")
+        use_bybit = st.checkbox("Bybit", value=True, key="rb_bybit")
     with c_tf:
         tf_label = st.selectbox("Khung thời gian", ["M5", "M15", "H1"], index=1, key="rb_tf",
             help="Range bot thấy rõ nhất ở M15")
@@ -854,7 +882,7 @@ with tab4:
     # Token ưu tiên — luôn scan, không bị cắt khỏi top pairs
     watchlist_raw = st.text_input(
         "📌 Token ưu tiên (luôn scan dù nằm ngoài top — cách nhau dấu phẩy)",
-        placeholder="VD: LMGX_USDT, KOMA_USDT  (MEXC thì không có gạch dưới: KOMAUSDT)",
+        placeholder="VD: KOMAUSDT, LMGXUSDT  (MEXC và Bybit đều dùng dạng liền, không gạch dưới)",
         key="rb_watchlist")
     watchlist = tuple(s.strip().upper() for s in watchlist_raw.split(",") if s.strip())
 
@@ -871,36 +899,36 @@ with tab4:
             help="Số lần giá chuyển xen kẽ giữa biên trên và biên dưới")
     with c_cfg4:
         max_scan_pairs = st.slider("Số pairs scan / sàn", 100, 500, 300, 50,
-            help="Quét top N pair theo volume 24h (MEXC). Nhiều hơn = chậm hơn")
+            help="Quét top N pair theo volume 24h. Nhiều hơn = chậm hơn")
 
     if min_range_pct >= max_range_pct:
         st.warning(f"⚠️ Range tối thiểu ({min_range_pct}%) ≥ tối đa ({max_range_pct}%) → sẽ không ra token. Giảm tối thiểu hoặc tăng tối đa.")
 
-    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Range rộng = ăn đậm mỗi cú nhưng SỐ token ít hơn nhiều. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · BitMart ~0.5%) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
+    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Range rộng = ăn đậm mỗi cú nhưng SỐ token ít hơn nhiều. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · Bybit ~0.2% — số tham khảo, tự verify lại theo tier phí thật) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
         scan_btn = st.button("🔄 Scan ngay", use_container_width=True, key="range_scan_btn")
     with col_info:
-        est = " · BitMart hơi chậm hơn MEXC" if use_bitmart else ""
+        est = " · Bybit tốc độ tương đương MEXC" if use_bybit else ""
         st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Scan song song (~20-40s) · Cache 5 phút · Chỉ chạy khi bấm{est}</div>', unsafe_allow_html=True)
 
     # Scan CHỈ chạy khi bấm nút → lưu kết quả vào session (không tự scan mỗi lần mở app/đổi filter)
-    if scan_btn and (use_mexc or use_bitmart):
+    if scan_btn and (use_mexc or use_bybit):
         scan_range_bots.clear()  # CHỈ xóa cache scan này, không nuke CG/CMC
-        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('BitMart',use_bitmart)] if on])} · {tf_label}..."):
+        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('Bybit',use_bybit)] if on])} · {tf_label}..."):
             res, err = scan_range_bots(
                 max_scan=max_scan_pairs, tf_minutes=tf_minutes,
-                scan_mexc=use_mexc, scan_bitmart=use_bitmart,
+                scan_mexc=use_mexc, scan_bybit=use_bybit,
                 min_range_pct=min_range_pct, watchlist=watchlist)
         st.session_state["rb_results"] = res
         st.session_state["rb_err"] = err
         st.session_state["rb_loaded"] = True
 
-    if not use_mexc and not use_bitmart:
+    if not use_mexc and not use_bybit:
         st.warning("⚠️ Chọn ít nhất 1 sàn để scan.")
     elif not st.session_state.get("rb_loaded"):
-        st.info("Bấm **Scan ngay** để quét MEXC/BitMart. (Scan chỉ chạy khi bấm — không tự chạy mỗi lần mở app hay đổi filter.)")
+        st.info("Bấm **Scan ngay** để quét MEXC/Bybit. (Scan chỉ chạy khi bấm — không tự chạy mỗi lần mở app hay đổi filter.)")
     else:
         range_results = st.session_state.get("rb_results", [])
         scan_err      = st.session_state.get("rb_err")
@@ -952,7 +980,7 @@ with tab4:
                 for item in display:
                     cols = st.columns([1, 1.7, 1, 1, 1, 1.1, 1.1, 1.3, 1])
                     ex = item.get("exchange", "")
-                    ex_badge = "badge-mexc" if ex == "MEXC" else "badge-bitmart"
+                    ex_badge = "badge-mexc" if ex == "MEXC" else "badge-bybit"
                     cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {ex_badge}">{ex}</span></div>', unsafe_allow_html=True)
                     _star = "📌 " if item.get("watched") else ""
                     _warns = item.get("warnings", [])
@@ -981,4 +1009,4 @@ with tab4:
 
                 st.markdown('<div class="warning">⚠️ Net% = range trừ phí round-trip (đã ăn được nguyên range — thực tế còn ít hơn). Net dương chỉ là điều kiện CẦN. Bot có thể dừng bất kỳ lúc nào → giá dump. Luôn đặt SL chặt ngoài range.</div>', unsafe_allow_html=True)
 
-st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC + BitMart · Research only</div>', unsafe_allow_html=True)
+st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC + Bybit · Research only</div>', unsafe_allow_html=True)
