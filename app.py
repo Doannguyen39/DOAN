@@ -507,6 +507,132 @@ def scan_range_bots(rank_start=100, rank_end=600, tf_minutes=60, scan_mexc=True,
     return results[:80], None
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 🎣 CÂU RÂU (WICK HUNTER) — coin đi ngang hay bị RÂU DÀI quét xuống rồi RÚT lên
+# ═══════════════════════════════════════════════════════════════════════════════
+def analyze_wick_hunter(kdata, min_wick_pct=6.0, min_wick_count=4, force=False):
+    """Tìm coin ĐI NGANG hay bị RÂU DÀI quét xuống rồi RÚT LÊN (mồi câu limit).
+       Đếm cú: low quét sâu ≥ min_wick_pct dưới close nến trước → rồi close RÚT lại (≥ -1.5%).
+       Loại coin đang DUMP thật (trend xuống mạnh — râu ở đó không rút)."""
+    highs = kdata["highs"]; lows = kdata["lows"]; closes = kdata["closes"]; vols = kdata["volumes"]
+    n = len(closes)
+    if n < 30:
+        return None
+    warnings = []
+
+    # Trend filter — né coin đang dump thật (râu = dao rơi, không rút)
+    xs = list(range(n)); mx = sum(xs) / n; my = sum(closes) / n
+    cov = sum((xs[i] - mx) * (closes[i] - my) for i in range(n))
+    varx = sum((xs[i] - mx) ** 2 for i in range(n))
+    slope = cov / varx if varx > 0 else 0
+    span = max(highs) - min(lows)
+    trend_ratio = abs(slope) * (n - 1) / span if span > 0 else 0
+    if slope < 0 and trend_ratio > 0.4:
+        if not force:
+            return None
+        warnings.append("đang dump (trend xuống)")
+
+    # Đếm event câu râu: low quét sâu rồi close rút lên
+    events = []
+    for i in range(1, n):
+        ref = closes[i - 1]
+        if ref <= 0:
+            continue
+        wick = (ref - lows[i]) / ref * 100          # low dip bao nhiêu % dưới close trước
+        recovered = closes[i] >= ref * 0.985         # close rút lại ≥ -1.5% so ref
+        if wick >= min_wick_pct and recovered:
+            events.append(wick)
+    count = len(events)
+    if count < min_wick_count:
+        if not force:
+            return None
+        warnings.append(f"chỉ {count} râu")
+
+    avg_wick = sum(events) / count if count else 0
+    max_wick = max(events) if events else 0
+    cur = closes[-1]
+    limit_lo = cur * (1 - avg_wick / 100)            # limit NÔNG (hay trúng)
+    limit_hi = cur * (1 - max_wick / 100)            # limit SÂU (trúng khi wick lớn)
+
+    score = (min(35, count * 5)                      # tần suất râu
+             + min(25, avg_wick * 2.5)               # độ sâu TB
+             + min(15, (max_wick - avg_wick))        # có cú sâu bonus
+             + max(0, 25 - trend_ratio * 40))        # càng đi ngang càng tốt
+
+    return {"count": count, "avg_wick": round(avg_wick, 1), "max_wick": round(max_wick, 1),
+            "current_price": cur, "limit_lo": limit_lo, "limit_hi": limit_hi,
+            "trend_ratio": round(trend_ratio, 2), "warnings": warnings,
+            "score": round(score, 1), "is_clean": len(warnings) == 0}
+
+
+def _scan_exchange_wick(pairs, fetch_fn, exchange_name, wl, workers, min_wick_pct):
+    out = []
+    if not pairs:
+        return out
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_map = {ex.submit(fetch_fn, sym): sym for sym in pairs}
+        for fut in as_completed(fut_map):
+            sym = fut_map[fut]
+            try:
+                kdata = fut.result()
+            except Exception:
+                continue
+            if not kdata:
+                continue
+            res = analyze_wick_hunter(kdata, min_wick_pct=min_wick_pct, force=_wl_hit(sym, wl))
+            if res:
+                res["symbol"] = sym
+                res["exchange"] = exchange_name
+                res["watched"] = _wl_hit(sym, wl)
+                out.append(res)
+    return out
+
+
+@st.cache_data(ttl=300)
+def scan_wick_hunter(rank_start=100, rank_end=600, tf_minutes=15, scan_mexc=True,
+                     scan_gate=True, min_wick_pct=6.0, watchlist=()):
+    """Quét câu-râu MEXC + Gate (song song). Dùng lại infra pairs/rank/volume của range bot."""
+    results = []
+    any_pairs = False
+    wl = set(s.strip().upper().replace("_", "") for s in watchlist if s.strip())
+    mexc_interval = f"{tf_minutes}m" if tf_minutes < 60 else "60m" if tf_minutes == 60 else "4h"
+    gate_interval = f"{tf_minutes}m" if tf_minutes < 60 else "1h" if tf_minutes == 60 else "4h"
+
+    if scan_mexc:
+        pairs = get_mexc_usdt_pairs()
+        if pairs:
+            any_pairs = True
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
+            vols = get_mexc_volumes()
+            wl_p = [p for p in pairs if _wl_hit(p, wl)]
+            rest = [p for p in pairs if not _wl_hit(p, wl)]
+            if vols:
+                rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
+            rest = rest[rank_start:rank_end]
+            pairs = wl_p + rest
+            fetch = lambda s: get_mexc_klines(s, interval=mexc_interval, limit=200)
+            results += _scan_exchange_wick(pairs, fetch, "MEXC", wl, WORKERS_MEXC, min_wick_pct)
+
+    if scan_gate:
+        pairs = get_gate_usdt_pairs()
+        if pairs:
+            any_pairs = True
+            pairs = [p for p in pairs if not any(s in p for s in SKIP_COINS) and not _is_leveraged(p)]
+            vols = get_gate_volumes()
+            wl_p = [p for p in pairs if _wl_hit(p, wl)]
+            rest = [p for p in pairs if not _wl_hit(p, wl)]
+            if vols:
+                rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
+            rest = rest[rank_start:rank_end]
+            pairs = wl_p + rest
+            fetch = lambda s: get_gate_klines(s, interval=gate_interval, limit=200)
+            results += _scan_exchange_wick(pairs, fetch, "Gate", wl, WORKERS_GATE, min_wick_pct)
+
+    if not any_pairs:
+        return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
+    results.sort(key=lambda x: (not x.get("watched", False), -x["score"]))
+    return results[:80], None
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TREND SẮP PUMP SCANNER — Tầng LỰC K23 (RSI14 + EMA9/WMA45) trên MEXC + Gate
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tham số CỨNG trích từ k23_core_v2.pine / k23_v3.pine (buổi 3-5) — KHÔNG bịa:
@@ -828,7 +954,7 @@ def score_token(data):
 st.markdown("""
 <div class="main-header">
     <p class="main-title">💎 Gem Hunter</p>
-    <p style="color:#8b949e;font-size:0.9rem;margin-top:8px;">Phân tích token micro-cap · Narrative Scanner · Range Bot · Dữ liệu realtime</p>
+    <p style="color:#8b949e;font-size:0.9rem;margin-top:8px;">Phân tích token micro-cap · Narrative Scanner · Câu Râu · Dữ liệu realtime</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -930,7 +1056,7 @@ if search_btn and query:
 
 # ─── TABS ─────────────────────────────────────────────────────────────────────
 st.markdown("<br><hr style='border-color:#21262d;'><br>", unsafe_allow_html=True)
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Trending", "💎 Micro-cap <$5M", "🔍 Narrative Scanner", "🤖 Range Bot Scanner", "🚀 Trend Sắp Pump"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Trending", "💎 Micro-cap <$5M", "🔍 Narrative Scanner", "🎣 Câu Râu", "🚀 Trend Sắp Pump"])
 
 with tab1:
     trending=get_trending()
@@ -1081,155 +1207,107 @@ with tab3:
 with tab4:
     st.markdown("""
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
-        <div style="font-weight:600;color:#e6edf3;">🤖 Range Bot Scanner</div>
+        <div style="font-weight:600;color:#e6edf3;">🎣 Câu Râu — Wick Hunter</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
-            Phát hiện token bị bot dev chạy liquidity trong range ổn định · MEXC + Gate Spot · Scan song song · Cache 5 phút
+            Tìm coin ĐI NGANG hay bị RÂU DÀI quét xuống rồi RÚT LÊN → đặt buy limit hứng hàng giá rẻ · MEXC + Gate · Cache 5 phút
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Chọn sàn + khung thời gian
-    c_ex1, c_ex2, c_tf = st.columns([1.2, 1.2, 1.6])
-    with c_ex1:
-        use_mexc = st.checkbox("MEXC", value=True, key="rb_mexc")
-    with c_ex2:
-        use_gate = st.checkbox("Gate.io", value=True, key="rb_gate")
-    with c_tf:
-        tf_label = st.selectbox("Khung thời gian", ["M5", "M15", "H1"], index=1, key="rb_tf",
-            help="Range bot thấy rõ nhất ở M15")
-    tf_map = {"M5": 5, "M15": 15, "H1": 60}
-    tf_minutes = tf_map[tf_label]
+    cw1, cw2, cw3 = st.columns([1.2, 1.2, 1.6])
+    with cw1:
+        w_mexc = st.checkbox("MEXC", value=True, key="w_mexc")
+    with cw2:
+        w_gate = st.checkbox("Gate.io", value=True, key="w_gate")
+    with cw3:
+        w_tf_label = st.selectbox("Khung thời gian", ["M5", "M15", "H1"], index=1, key="w_tf",
+            help="Râu quét thấy rõ nhất ở M5/M15")
+    w_tf_minutes = {"M5": 5, "M15": 15, "H1": 60}[w_tf_label]
 
-    # Token ưu tiên — luôn scan, không bị cắt khỏi top pairs
-    watchlist_raw = st.text_input(
-        "📌 Token ưu tiên (luôn scan dù nằm ngoài top — cách nhau dấu phẩy)",
-        placeholder="VD: KOMAUSDT, LMGXUSDT  (gõ liền hay có gạch dưới đều được — tự khớp cả MEXC lẫn Gate)",
-        key="rb_watchlist")
-    watchlist = tuple(s.strip().upper() for s in watchlist_raw.split(",") if s.strip())
+    w_wl_raw = st.text_input(
+        "📌 Token ưu tiên (luôn scan — cách nhau dấu phẩy)",
+        placeholder="VD: KOMAUSDT, LMGXUSDT  (gõ liền hay có gạch dưới đều được)",
+        key="w_watchlist")
+    w_watchlist = tuple(s.strip().upper() for s in w_wl_raw.split(",") if s.strip())
 
-    # Config filter
-    c_cfg1, c_cfg2, c_cfg3, c_cfg4 = st.columns(4)
-    with c_cfg1:
-        min_range_pct = st.slider("Range tối thiểu (%)", 1.0, 20.0, 5.0, 0.5,
-            help="Chỉ lấy token range đủ rộng để bõ công canh tay. Mặc định ≥5%")
-    with c_cfg2:
-        max_range_pct = st.slider("Range tối đa (%)", 5, 40, 30, 1,
-            help="Token dao động trong range hẹp hơn mức này")
-    with c_cfg3:
-        min_oscillations = st.slider("Oscillation tối thiểu", 2, 15, 4, 1,
-            help="Số lần giá chuyển xen kẽ giữa biên trên và biên dưới")
-    with c_cfg4:
-        rank_band = st.slider("Dải hạng volume (né top)", 0, 1500, (100, 600), 50,
-            help="Bỏ N coin top đầu (volume cao = coin lớn, không có range bot) → quét dải lowcap. Mặc định hạng 100–600. Muốn moi sâu hơn kéo phải.")
-        rank_start, rank_end = rank_band
+    cwa, cwb, cwc = st.columns(3)
+    with cwa:
+        w_min_wick = st.slider("Độ sâu râu tối thiểu (%)", 3.0, 20.0, 6.0, 0.5,
+            help="Chỉ tính cú râu quét sâu ≥ mức này rồi RÚT lên")
+    with cwb:
+        w_min_count = st.slider("Số râu tối thiểu", 2, 20, 4, 1,
+            help="Coin phải có ≥ N cú râu trong 200 nến → hay bị quét, đáng câu")
+    with cwc:
+        w_band = st.slider("Dải hạng volume (né top)", 0, 1500, (100, 600), 50,
+            help="Né top coin (thanh khoản cao = không có râu). Quét dải lowcap.")
+        w_rank_start, w_rank_end = w_band
 
-    if min_range_pct >= max_range_pct:
-        st.warning(f"⚠️ Range tối thiểu ({min_range_pct}%) ≥ tối đa ({max_range_pct}%) → sẽ không ra token. Giảm tối thiểu hoặc tăng tối đa.")
+    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Coin đi ngang + hay có râu dưới SÂU mà giá RÚT LÊN = mồi câu limit. Cột <b>Vùng đặt LIMIT</b> = gợi ý giá đặt buy limit (nông = hay trúng · sâu = trúng khi wick lớn). Chỉ chơi coin RANGING, SL ngoài range.</div>', unsafe_allow_html=True)
 
-    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Né top coin (thanh khoản cao = coin lớn, đi trend) → quét dải hạng lowcap tìm mô hình sideway ổn định. Cột <b>Net%</b> = range trừ phí (MEXC ~0.1% · Gate ~0.4% — số tham khảo, tự verify lại theo tier phí thật) — chỉ chọn Net dương.</div>', unsafe_allow_html=True)
+    cwbtn, cwinfo = st.columns([1, 3])
+    with cwbtn:
+        w_scan_btn = st.button("🎣 Quét câu râu", use_container_width=True, key="wick_scan_btn")
+    with cwinfo:
+        st.markdown('<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Lấy 200 nến/con · ~20-40s · Cache 5 phút · Chỉ chạy khi bấm</div>', unsafe_allow_html=True)
 
-    col_btn, col_info = st.columns([1, 3])
-    with col_btn:
-        scan_btn = st.button("🔄 Scan ngay", use_container_width=True, key="range_scan_btn")
-    with col_info:
-        est = " · Gate ~2000+ pair, quét lâu hơn chút" if use_gate else ""
-        st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Scan song song (~20-40s) · Cache 5 phút · Chỉ chạy khi bấm{est}</div>', unsafe_allow_html=True)
+    if w_scan_btn and (w_mexc or w_gate):
+        scan_wick_hunter.clear()
+        with st.spinner(f"🎣 Đang quét râu · {w_tf_label} · hạng {w_rank_start}–{w_rank_end}..."):
+            w_res, w_err = scan_wick_hunter(
+                rank_start=w_rank_start, rank_end=w_rank_end, tf_minutes=w_tf_minutes,
+                scan_mexc=w_mexc, scan_gate=w_gate, min_wick_pct=w_min_wick, watchlist=w_watchlist)
+        st.session_state["w_results"] = w_res
+        st.session_state["w_err"] = w_err
+        st.session_state["w_loaded"] = True
 
-    # Scan CHỈ chạy khi bấm nút → lưu kết quả vào session (không tự scan mỗi lần mở app/đổi filter)
-    if scan_btn and (use_mexc or use_gate):
-        scan_range_bots.clear()  # CHỈ xóa cache scan này, không nuke CG/CMC
-        with st.spinner(f"🔍 Đang scan {' + '.join([x for x,on in [('MEXC',use_mexc),('Gate',use_gate)] if on])} · {tf_label} · hạng {rank_start}–{rank_end}..."):
-            res, err = scan_range_bots(
-                rank_start=rank_start, rank_end=rank_end, tf_minutes=tf_minutes,
-                scan_mexc=use_mexc, scan_gate=use_gate,
-                min_range_pct=min_range_pct, watchlist=watchlist)
-        st.session_state["rb_results"] = res
-        st.session_state["rb_err"] = err
-        st.session_state["rb_loaded"] = True
-
-    if not use_mexc and not use_gate:
-        st.warning("⚠️ Chọn ít nhất 1 sàn để scan.")
-    elif not st.session_state.get("rb_loaded"):
-        st.info("Bấm **Scan ngay** để quét MEXC/Gate. (Scan chỉ chạy khi bấm — không tự chạy mỗi lần mở app hay đổi filter.)")
+    if not w_mexc and not w_gate:
+        st.warning("⚠️ Chọn ít nhất 1 sàn để quét.")
+    elif not st.session_state.get("w_loaded"):
+        st.info("Bấm **Quét câu râu** để tìm coin hay bị râu quét. (Chỉ chạy khi bấm.)")
     else:
-        range_results = st.session_state.get("rb_results", [])
-        scan_err      = st.session_state.get("rb_err")
-
-        if scan_err:
-            st.error(f"Lỗi: {scan_err}")
-        elif not range_results:
-            st.info("Không tìm thấy token nào match pattern. Thử tăng Range tối đa, giảm Oscillation tối thiểu, hoặc mở rộng dải hạng volume rồi Scan lại.")
+        w_results = st.session_state.get("w_results", [])
+        w_err = st.session_state.get("w_err")
+        if w_err:
+            st.error(f"Lỗi: {w_err}")
+        elif not w_results:
+            st.info("Không thấy coin nào đủ râu. Hạ 'độ sâu' / 'số râu' tối thiểu, hoặc mở rộng dải hạng rồi quét lại.")
         else:
-            # Lọc theo config — nhưng watchlist LUÔN qua (để theo dõi liên tục)
-            filtered = [r for r in range_results
-                        if r.get("watched")
-                        or (r["range_pct"] <= max_range_pct and r["oscillations"] >= min_oscillations)]
-
-            buy_zone  = [r for r in filtered if "BUY"  in r["signal"]]
-            sell_zone = [r for r in filtered if "SELL" in r["signal"]]
-            mid_zone  = [r for r in filtered if "MID"  in r["signal"]]
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#58a6ff">{len(filtered)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">TOKEN TÌM THẤY</div></div>', unsafe_allow_html=True)
-            m2.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#3fb950">{len(buy_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🟢 BUY ZONE</div></div>', unsafe_allow_html=True)
-            m3.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#f85149">{len(sell_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🔴 SELL ZONE</div></div>', unsafe_allow_html=True)
-            m4.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#8b949e">{len(mid_zone)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">⚪ MID RANGE</div></div>', unsafe_allow_html=True)
-
+            w_disp = [r for r in w_results if r.get("watched") or r["count"] >= w_min_count]
+            mw1, mw2, mw3 = st.columns(3)
+            mw1.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#a371f7">{len(w_disp)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">COIN HAY BỊ RÂU</div></div>', unsafe_allow_html=True)
+            _deep = [r for r in w_disp if r["max_wick"] >= 12]
+            _many = [r for r in w_disp if r["count"] >= 8]
+            mw2.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#f85149">{len(_deep)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">RÂU SÂU ≥12%</div></div>', unsafe_allow_html=True)
+            mw3.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#3fb950">{len(_many)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">QUÉT NHIỀU ≥8 lần</div></div>', unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(w_disp)} coin · Sắp xếp theo Score (nhiều râu + sâu + đi ngang)</div>', unsafe_allow_html=True)
 
-            show_filter = st.radio("Hiển thị:", ["Tất cả", "🟢 Buy Zone", "🔴 Sell Zone"],
-                                   horizontal=True, key="rb_filter")
+            hc = st.columns([1, 1.7, 1.1, 0.9, 1.0, 1.0, 2.4, 0.9])
+            for col, h in zip(hc, ["Sàn", "Symbol", "Giá", "Số râu", "Sâu TB", "Sâu nhất", "Vùng đặt LIMIT", "Score"]):
+                col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
 
-            if show_filter == "🟢 Buy Zone":
-                display = buy_zone
-            elif show_filter == "🔴 Sell Zone":
-                display = sell_zone
-            else:
-                display = filtered
+            def _fpw(v):
+                return f"${v:.6f}" if v < 0.01 else f"${v:.4f}" if v < 1 else f"${v:.2f}"
 
-            if not display:
-                st.info("Không có token trong zone này.")
-            else:
-                st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(display)} token · Sắp xếp theo Bot Score cao nhất</div>', unsafe_allow_html=True)
+            for it in w_disp:
+                cols = st.columns([1, 1.7, 1.1, 0.9, 1.0, 1.0, 2.4, 0.9])
+                ex = it.get("exchange", "")
+                exb = "badge-mexc" if ex == "MEXC" else "badge-gate"
+                cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {exb}">{ex}</span></div>', unsafe_allow_html=True)
+                star = "📌 " if it.get("watched") else ""
+                wn = it.get("warnings", [])
+                wh = f'<div style="color:#e3b341;font-size:0.65rem;margin-top:2px;">⚠️ {", ".join(wn)}</div>' if (it.get("watched") and wn) else ""
+                cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{star}{it["symbol"]}{wh}</div>', unsafe_allow_html=True)
+                cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{_fpw(it["current_price"])}</div>', unsafe_allow_html=True)
+                cols[3].markdown(f'<div style="padding-top:8px;font-weight:700;color:#a371f7;">{it["count"]}</div>', unsafe_allow_html=True)
+                cols[4].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.85rem;">{it["avg_wick"]}%</div>', unsafe_allow_html=True)
+                cols[5].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.85rem;">{it["max_wick"]}%</div>', unsafe_allow_html=True)
+                cols[6].markdown(f'<div style="padding-top:8px;font-size:0.8rem;color:#3fb950;">{_fpw(it["limit_lo"])} <span style="color:#8b949e;">→</span> {_fpw(it["limit_hi"])}</div>', unsafe_allow_html=True)
+                sc = it["score"]
+                scc = "#3fb950" if sc >= 60 else "#d29922" if sc >= 40 else "#8b949e"
+                cols[7].markdown(f'<div style="padding-top:8px;font-weight:700;color:{scc};">{sc}</div>', unsafe_allow_html=True)
 
-                hcols = st.columns([1, 1.7, 1, 1, 1, 1.1, 1.1, 1.3, 1])
-                for col, h in zip(hcols, ["Sàn", "Symbol", "Giá", "Range%", "Net%", "Low", "High", "Vị trí", "Score"]):
-                    col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
-
-                def fmt_p(v):
-                    return f"${v:.6f}" if v < 0.01 else f"${v:.4f}" if v < 1 else f"${v:.2f}"
-
-                for item in display:
-                    cols = st.columns([1, 1.7, 1, 1, 1, 1.1, 1.1, 1.3, 1])
-                    ex = item.get("exchange", "")
-                    ex_badge = "badge-mexc" if ex == "MEXC" else "badge-gate"
-                    cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {ex_badge}">{ex}</span></div>', unsafe_allow_html=True)
-                    _star = "📌 " if item.get("watched") else ""
-                    _warns = item.get("warnings", [])
-                    _warn_html = ""
-                    if item.get("watched") and _warns:
-                        _warn_html = f'<div style="color:#e3b341;font-size:0.65rem;margin-top:2px;">⚠️ {", ".join(_warns)}</div>'
-                    cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{_star}{item["symbol"]}{_warn_html}</div>', unsafe_allow_html=True)
-                    cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{fmt_p(item["current_price"])}</div>', unsafe_allow_html=True)
-                    cols[3].markdown(f'<div style="padding-top:8px;color:#d29922;font-size:0.85rem;">{item["range_pct"]:.1f}%</div>', unsafe_allow_html=True)
-                    net = item.get("net_edge", 0)
-                    net_color = "#3fb950" if net >= 0.3 else "#d29922" if net > 0 else "#f85149"
-                    cols[4].markdown(f'<div style="padding-top:8px;color:{net_color};font-size:0.85rem;font-weight:600;">{net:+.2f}%</div>', unsafe_allow_html=True)
-                    cols[5].markdown(f'<div style="padding-top:8px;color:#f85149;font-size:0.78rem;">{fmt_p(item["range_low"])}</div>', unsafe_allow_html=True)
-                    cols[6].markdown(f'<div style="padding-top:8px;color:#3fb950;font-size:0.78rem;">{fmt_p(item["range_high"])}</div>', unsafe_allow_html=True)
-                    pos = item["pos_in_range"]
-                    bar_color = item["signal_color"]
-                    cols[7].markdown(f"""
-                    <div style="padding-top:10px;">
-                        <div style="background:#21262d;border-radius:4px;height:6px;width:100%;">
-                            <div style="background:{bar_color};width:{pos:.0f}%;height:6px;border-radius:4px;"></div>
-                        </div>
-                        <div style="color:{bar_color};font-size:0.7rem;margin-top:3px;">{item["signal"]} · {pos:.0f}%</div>
-                    </div>""", unsafe_allow_html=True)
-                    score_color = "#3fb950" if item["score"] >= 60 else "#d29922" if item["score"] >= 40 else "#8b949e"
-                    cols[8].markdown(f'<div style="padding-top:8px;font-weight:700;color:{score_color};">{item["score"]}</div>', unsafe_allow_html=True)
-
-                st.markdown('<div class="warning">⚠️ Net% = range trừ phí round-trip (đã ăn được nguyên range — thực tế còn ít hơn). Net dương chỉ là điều kiện CẦN. Bot có thể dừng bất kỳ lúc nào → giá dump. Luôn đặt SL chặt ngoài range.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="warning">⚠️ RỦI RO: "râu quét rồi rút" ≠ "dump thật gãy range". Nếu coin GÃY range → limit trúng vào dao rơi. → Chỉ đặt trên coin ĐI NGANG xác nhận · <b>stagger</b> limit nhiều mức (nông→sâu) · <b>size NHỎ</b> mỗi mức · có <b>SL</b> cắt khi gãy range dứt khoát. KHÔNG "trung bình giá" khi gãy.</div>', unsafe_allow_html=True)
 
 with tab5:
     st.markdown("""
