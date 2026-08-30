@@ -690,9 +690,13 @@ def _wma_series(vals, length):
 
 def analyze_trend_pump(kdata, p):
     """
-    Tầng 1 (MÁY, bắt trễ): chỉ giữ con đã có TREND TĂNG xác nhận qua lực K23.
-    Tầng 2 (BÀY): RSI + trạng thái 2 MA + dư địa (xăng) + C-lên + quán tính để mắt canh vào.
-    Chỉ tính nến ĐÓNG (quy tắc cứng b3) → dùng nến áp chót (nến cuối đang chạy).
+    Tầng 1 (MÁY): lọc theo QUY LUẬT 1 của thầy — "có mô hình thì vào, không có thì thôi" (b8 33:23).
+    Tầng 2 (BÀY): RSI · độ mạnh · nở · xăng · A' để MẮT Kevin canh điểm vào.
+    Chỉ tính nến ĐÓNG (b3) → dùng nến áp chót.
+
+    Hai chế độ:
+      "tre"    — con ĐÃ có trend tăng xác nhận (bắt trễ, an toàn hơn)
+      "apham"  — con vừa có A': cung tích lũy MỚI ĐÓNG, xăng còn nhiều (bắt sớm — tìm gem)
     """
     closes = kdata["closes"]; highs = kdata["highs"]; lows = kdata["lows"]; vols = kdata["volumes"]
     n = len(closes)
@@ -710,77 +714,123 @@ def analyze_trend_pump(kdata, p):
     spread = ema_now - wma_now
     slope  = (emaF[i] - emaF[i - sb]) / sb
 
-    # Trạng thái 2 MA (b3)
-    if ema_now > wma_now and spread >= p["minSpread"] and slope >= p["minSlope"]:
-        state = 1
-    elif ema_now < wma_now and spread <= -p["minSpread"] and slope <= -p["minSlope"]:
-        state = -1
-    else:
-        state = 0
+    # ── ĐỘ MẠNH TƯƠNG ĐỐI thay 2 ngưỡng tuyệt đối cũ (minSpread 2.0 / minSlope 0.10 — SỐ BỊA).
+    #    Thầy KHÔNG cho ngưỡng "mở rộng bao nhiêu là đủ" (b15), và ở b4 2:13 thầy còn bác thẳng
+    #    cách lượng hoá bằng chênh lệch WMA45 ("ngay cả mô hình số 7 cũng không hề mạnh").
+    #    Nên đo |EMA-WMA| so với CHÍNH lịch sử con đó: 100% = rộng nhất từng thấy.
+    hist = np.abs(emaF - wmaS)
+    hist = hist[~np.isnan(hist)]
+    manh = 0.0
+    if len(hist) >= 20:
+        dinh = float(np.percentile(hist, 95))
+        if dinh > 0:
+            manh = min(100.0, abs(spread) / dinh * 100.0)
+    #    Hướng tính THUẦN theo vị trí 2 đường + dốc — KHÔNG áp ngưỡng số nào lên độ mạnh,
+    #    vì thầy không cho ngưỡng (b15) và đã bác cách lượng hoá đó (b4 2:13).
+    #    `manh` chỉ để BÀY cho mắt: 0% = quấn dây điện, 100% = rộng nhất từng thấy.
+    state = 1 if (ema_now > wma_now and slope > 0) else -1 if (ema_now < wma_now and slope < 0) else 0
 
-    # ── TẦNG 1: LỌC "đã có trend TĂNG" (bắt trễ) ──
-    if state != 1:
+    # ── NỞ: cung đang MỞ RA hay KHÉP LẠI (b4 ~2:34) ──
+    #    "mở mở dần ra" = lực thuận tích lũy TĂNG · "thu hẹp dần" = lực ngược tích lũy.
+    #    Thiếu cái này thì chỉ biết cung RỘNG bao nhiêu, không biết đang ở NỬA NÀO.
+    nb = p["noBars"]
+    no_rong = 0.0
+    if i - nb >= 0 and not np.isnan(emaF[i - nb]) and not np.isnan(wmaS[i - nb]):
+        no_rong = abs(spread) - abs(float(emaF[i - nb]) - float(wmaS[i - nb]))
+
+    # ── VÒNG CUNG + QUY LUẬT 1 (b8 33:23) ──
+    #    Cung MUA mở tại EMA cắt XUỐNG, đóng tại cắt LÊN -> chuẩn bị sóng TĂNG.
+    #    ĐỦ BA điều kiện mới là mô hình: cung đã đóng · mở NGOÀI 40-60 · có dốc + mở rộng.
+    idx_xuong = idx_len = -1
+    for j in range(i, max(0, i - 300), -1):
+        if j < 1 or np.isnan(emaF[j - 1]) or np.isnan(wmaS[j - 1]):
+            continue
+        if idx_len < 0 and emaF[j - 1] <= wmaS[j - 1] and emaF[j] > wmaS[j]:
+            idx_len = j
+        if idx_xuong < 0 and emaF[j - 1] >= wmaS[j - 1] and emaF[j] < wmaS[j]:
+            idx_xuong = j
+        if idx_len >= 0 and idx_xuong >= 0:
+            break
+    cung_mua_dong = idx_len > idx_xuong >= 0          # cắt lên MỚI HƠN cắt xuống
+    idx_mo   = idx_xuong if cung_mua_dong else idx_len
+    idx_dong = idx_len if cung_mua_dong else idx_xuong
+    rsi_mo   = float(rsiV[idx_mo]) if idx_mo >= 0 and not np.isnan(rsiV[idx_mo]) else None
+    rsi_dong = float(rsiV[idx_dong]) if idx_dong >= 0 and not np.isnan(rsiV[idx_dong]) else None
+    tuoi_cung = (i - idx_dong) if idx_dong >= 0 else 999
+    chuan_bi = 1 if cung_mua_dong else -1
+
+    ngoai_vung = rsi_mo is not None and (rsi_mo < 40 or rsi_mo > 60)
+    co_mo_hinh = bool(ngoai_vung and state != 0 and idx_dong >= 0)
+
+    # ⭐ QUY LUẬT 1 — không có mô hình thì loại thẳng, không cần xét gì thêm
+    if not co_mo_hinh:
         return None
-    if rsi_now < p["rsiMinForce"]:            # lực mua thật, né nhiễu 40-60 (note 01)
-        return None
+
+    # ── XĂNG đo từ điểm KẾT THÚC vòng cung = điểm A' (b2 1:23 · Kevin chốt) ──
+    #    Trước đây tính (80 - RSI)/(80 - 20) là đo trên TOÀN DẢI — sai mốc xuất phát.
+    if chuan_bi == 1:
+        goc = rsi_dong if rsi_dong is not None else K23_INERT_DN
+        fuel = (K23_INERT_UP - rsi_now) / max(1e-9, K23_INERT_UP - goc) * 100
+    else:
+        goc = rsi_dong if rsi_dong is not None else K23_INERT_UP
+        fuel = (rsi_now - K23_INERT_DN) / max(1e-9, goc - K23_INERT_DN) * 100
+    fuel = max(0.0, min(100.0, fuel))
+    quan_tinh = rsi_now >= K23_INERT_UP
+
     look = p["priceLook"]
     if i - look < 0 or closes[i - look] <= 0:
         return None
     price_chg = (closes[i] / closes[i - look] - 1) * 100
-    if price_chg < p["minTrendPct"]:          # giá thật sự đang đi lên
-        return None
-
-    # ── TẦNG 2: chỉ số BÀY để canh vào ──
     seg_hi = max(highs[i - look:i + 1]); seg_lo = min(lows[i - look:i + 1]); seg_span = seg_hi - seg_lo
     pos = (closes[i] - seg_lo) / seg_span * 100 if seg_span > 0 else 50.0
-    # Dư địa (xăng) tới mốc 80 — b5
-    fuel = (K23_INERT_UP - rsi_now) / (K23_INERT_UP - K23_INERT_DN) * 100
-    fuel = max(0.0, min(100.0, fuel))
-    quan_tinh = rsi_now >= K23_INERT_UP
-    # Volume nở
+
+    # ── LỌC theo chế độ ──
+    if p["mode"] == "tre":
+        # bắt trễ: trend TĂNG đã xác nhận
+        if state != 1 or rsi_now < p["rsiMinForce"] or price_chg < p["minTrendPct"]:
+            return None
+    else:
+        # bắt A' (tìm gem): cung chuẩn bị TĂNG vừa đóng, còn xăng, giá chưa chạy xa
+        if chuan_bi != 1:
+            return None
+        if tuoi_cung > p["apBars"]:
+            return None
+        if fuel < p["apFuelMin"]:
+            return None
+        if price_chg > p["apMaxRun"]:
+            return None
+
     vr_recent = sum(vols[i - 2:i + 1]) / 3 if i >= 2 else vols[i]
     seg_v = vols[max(0, i - look):i + 1]
     vr_all = sum(seg_v) / len(seg_v) if seg_v else 0
     vol_ratio = vr_recent / vr_all if vr_all > 0 else 0
-    # C lên (EMA9 cắt lên WMA45) trong cBars nến đóng gần nhất — b38/b15
-    c_up = False
-    for j in range(max(1, i - p["cBars"] + 1), i + 1):
-        if (not np.isnan(emaF[j - 1]) and not np.isnan(wmaS[j - 1])
-                and emaF[j - 1] <= wmaS[j - 1] and emaF[j] > wmaS[j]):
-            c_up = True
-            break
+    c_up = cung_mua_dong and tuoi_cung <= p["cBars"]
 
-    # Tín hiệu gợi ý (method-flavored — KHÔNG phải lệnh mua tự động)
     if fuel <= p["fuelLow"]:
-        signal, signal_color = "⚠️ XĂNG CẠN · canh đảo", "#f85149"   # xăng cạn = canh đảo
+        signal, signal_color = "⚠️ XĂNG CẠN · canh đảo", "#f85149"
+    elif p["mode"] == "apham":
+        signal, signal_color = f"🎯 A' cách {tuoi_cung} nến · xăng {fuel:.0f}%", "#a371f7"
     elif c_up:
         signal, signal_color = "🟢 C lên · còn xăng", "#3fb950"
     else:
         signal, signal_color = "⚪ Trend tăng · theo dõi", "#8b949e"
 
     score = 0.0
-    score += min(25, max(0, slope * 40))              # dốc RSI
-    score += min(20, max(0, spread * 4))              # 2 MA mở rộng
+    score += min(25, manh * 0.25)                     # độ mạnh tương đối
+    score += min(20, max(0, no_rong) * 2)             # đang MỞ RA
     score += min(20, fuel * 0.20)                     # còn xăng
     score += min(15, max(0, (vol_ratio - 1)) * 30)    # volume nở
-    score += min(10, max(0, price_chg))               # đà giá
-    score += 10 if c_up else 0                        # có C lên
+    score += min(10, max(0, 10 - tuoi_cung))          # A' còn tươi
+    score += 10 if c_up else 0
 
     return {
-        "current_price": closes[i],
-        "rsi": rsi_now,
-        "state": state,
-        "spread": spread,
-        "slope": slope,
-        "fuel": fuel,
-        "quan_tinh": quan_tinh,
-        "vol_ratio": vol_ratio,
-        "price_chg": price_chg,
-        "pos_in_range": pos,
-        "c_up": c_up,
-        "signal": signal,
-        "signal_color": signal_color,
-        "score": round(score, 1),
+        "current_price": closes[i], "rsi": rsi_now, "state": state,
+        "spread": spread, "slope": slope, "manh": manh, "no_rong": no_rong,
+        "fuel": fuel, "quan_tinh": quan_tinh, "vol_ratio": vol_ratio,
+        "price_chg": price_chg, "pos_in_range": pos, "c_up": c_up,
+        "rsi_mo": rsi_mo, "rsi_dong": rsi_dong, "tuoi_cung": tuoi_cung,
+        "chuan_bi": chuan_bi, "co_mo_hinh": co_mo_hinh,
+        "signal": signal, "signal_color": signal_color, "score": round(score, 1),
     }
 
 def _scan_exchange_tp(pairs, fetch_fn, exchange_name, wl, workers, p):
@@ -808,15 +858,17 @@ def _scan_exchange_tp(pairs, fetch_fn, exchange_name, wl, workers, p):
 
 @st.cache_data(ttl=300)
 def scan_trend_pump(rank_start=100, rank_end=600, tf_minutes=240, scan_mexc=True, scan_gate=True,
-                    rsiMinForce=55.0, minSpread=2.0, minSlope=0.10, slopeBars=3,
-                    minTrendPct=3.0, priceLook=20, fuelLow=25.0, cBars=3, watchlist=()):
+                    rsiMinForce=55.0, manhSide=30.0, noBars=6, slopeBars=3,
+                    minTrendPct=3.0, priceLook=20, fuelLow=25.0, cBars=3,
+                    mode="tre", apBars=12, apFuelMin=40.0, apMaxRun=20.0, watchlist=()):
     """Quét trend sắp pump MEXC + Gate. Lấy 150 nến để đủ warmup WMA45 trên RSI."""
     results = []
     any_pairs = False
     wl = set(s.strip().upper().replace("_", "") for s in watchlist if s.strip())
-    p = {"rsiMinForce": rsiMinForce, "minSpread": minSpread, "minSlope": minSlope,
+    p = {"rsiMinForce": rsiMinForce, "manhSide": manhSide, "noBars": noBars,
          "slopeBars": slopeBars, "minTrendPct": minTrendPct, "priceLook": priceLook,
-         "fuelLow": fuelLow, "cBars": cBars}
+         "fuelLow": fuelLow, "cBars": cBars, "mode": mode,
+         "apBars": apBars, "apFuelMin": apFuelMin, "apMaxRun": apMaxRun}
 
     mexc_interval = f"{tf_minutes}m" if tf_minutes < 60 else "60m" if tf_minutes == 60 else "4h" if tf_minutes == 240 else "1d"
     gate_interval = f"{tf_minutes}m" if tf_minutes < 60 else "1h" if tf_minutes == 60 else "4h" if tf_minutes == 240 else "1d"
@@ -1314,14 +1366,22 @@ with tab5:
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
         <div style="font-weight:600;color:#e6edf3;">🚀 Trend Sắp Pump — tầng LỰC K23</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
-            Tầng 1 (máy): lọc con <b>đã có trend TĂNG xác nhận</b> (bắt trễ) qua RSI14 + EMA9×WMA45.
-            Tầng 2 (bày): RSI · dư địa (xăng) · C-lên · quán tính để <b>mắt Kevin canh điểm vào</b>.
+            Tầng 1 (máy): <b>QUY LUẬT 1 của thầy</b> — "có mô hình thì vào, không có thì thôi" (b8 33:23).
+            Mô hình cần ĐỦ BA: cung đã đóng · mở <b>NGOÀI 40–60</b> · có dốc + mở rộng.
+            Tầng 2 (bày): RSI · độ mạnh · nở · xăng · A' để <b>mắt Kevin canh điểm vào</b>.
             MEXC + Gate · nến ĐÓNG · Cache 5 phút.
         </div>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown('<div class="warning">🧠 Tool chỉ <b>BÀY</b> RSI + 2 MA + xăng. <b>Phân kỳ 2 đỉnh/đáy để MẮT Kevin đọc</b> — máy không auto-lọc (bài học note 40/L13: máy so pivot kề → bắn sớm dính sweep). "Xăng cạn = canh ĐẢO", không phải chỗ long mới.</div>', unsafe_allow_html=True)
+
+    tp_mode_label = st.radio(
+        "Chế độ săn", ["🎯 Bắt A' — cung vừa đóng, sắp chạy (tìm gem)", "🐢 Bắt trễ — trend đã xác nhận"],
+        index=0, horizontal=True, key="tp_mode",
+        help="A' (b2 1:23) = điểm giá DỪNG GIẢM và bắt đầu tăng — chỗ thầy dạy mua. "
+             "Bắt trễ = chờ trend xác nhận rồi mới vào, an toàn hơn nhưng vị thế xấu hơn.")
+    tp_mode = "apham" if tp_mode_label.startswith("🎯") else "tre"
 
     ce1, ce2, ce3 = st.columns([1.2, 1.2, 1.6])
     with ce1:
@@ -1341,12 +1401,22 @@ with tab5:
     tp_watchlist = tuple(s.strip().upper() for s in tp_wl_raw.split(",") if s.strip())
 
     cc1, cc2, cc3, cc4 = st.columns(4)
-    with cc1:
-        tp_rsi_min = st.slider("RSI tối thiểu (lực mua)", 50.0, 75.0, 55.0, 1.0,
-            help="≥ mốc này mới coi là lực mua thật (note 01: 40-60 = nhiễu). Cao hơn = chắc nhưng vào trễ hơn.")
-    with cc2:
-        tp_trend_pct = st.slider("Đà giá tối thiểu (%)", 0.0, 30.0, 3.0, 0.5,
-            help=f"Giá phải tăng ≥ mức này trong {20} nến gần nhất → xác nhận đang trend, không đứng im.")
+    if tp_mode == "apham":
+        with cc1:
+            tp_ap_bars = st.slider("A' còn tươi trong (nến)", 1, 30, 12, 1,
+                help="Cung tích lũy đóng cách đây bao nhiêu nến thì còn coi là A' mới. Càng nhỏ càng sát điểm vào.")
+        with cc2:
+            tp_ap_fuel = st.slider("Xăng tối thiểu (%)", 20.0, 90.0, 40.0, 5.0,
+                help="Dư địa RSI từ điểm A' tới mốc 80. Thấp quá thì sóng đã chạy gần hết.")
+        tp_rsi_min, tp_trend_pct = 0.0, -999.0
+    else:
+        with cc1:
+            tp_rsi_min = st.slider("RSI tối thiểu (lực mua)", 50.0, 75.0, 55.0, 1.0,
+                help="≥ mốc này mới coi là lực mua thật. Cao hơn = chắc nhưng vào trễ hơn.")
+        with cc2:
+            tp_trend_pct = st.slider("Đà giá tối thiểu (%)", 0.0, 30.0, 3.0, 0.5,
+                help="Giá phải tăng ≥ mức này trong 20 nến gần nhất → xác nhận đang trend.")
+        tp_ap_bars, tp_ap_fuel = 12, 40.0
     with cc3:
         tp_fuel_low = st.slider("Ngưỡng xăng cạn (%)", 5.0, 50.0, 25.0, 1.0,
             help="Dư địa RSI tới 80 dưới mức này → cảnh báo KIỆT (canh đảo, không phải long mới). Số 'không nguồn — chỉnh mắt' theo pine Kevin.")
@@ -1355,7 +1425,7 @@ with tab5:
             help="Bỏ N coin top → quét dải lowcap (giống Range Bot).")
         tp_rank_start, tp_rank_end = tp_band
 
-    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 Cột <b>Xăng%</b> = dư địa RSI tới 80 (còn chạy tiếp được không). <b>C↑</b> = EMA9 vừa cắt lên WMA45 (điểm vào lý thuyết b38). <b>Trạng thái</b>: chỉ hiện con trend TĂNG đã xác nhận.</div>', unsafe_allow_html=True)
+    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 <b>Cung mở</b> = RSI lúc cung tích lũy bắt đầu — phải NGOÀI 40–60 mới tính là mô hình (b3 2:38). <b>m%</b> = độ mạnh so với chính lịch sử con đó (100% = rộng nhất từng thấy). <b>Nở</b> = cung đang mở ra hay khép lại (b4 2:34). <b>Xăng</b> đo từ điểm KẾT THÚC cung = điểm A\'. <b>A\'</b> = cung đóng cách đây mấy nến.</div>', unsafe_allow_html=True)
 
     cb1, cb2 = st.columns([1, 3])
     with cb1:
@@ -1370,6 +1440,7 @@ with tab5:
                 rank_start=tp_rank_start, rank_end=tp_rank_end, tf_minutes=tp_tf_minutes,
                 scan_mexc=tp_mexc, scan_gate=tp_gate,
                 rsiMinForce=tp_rsi_min, minTrendPct=tp_trend_pct, fuelLow=tp_fuel_low,
+                mode=tp_mode, apBars=tp_ap_bars, apFuelMin=tp_ap_fuel,
                 watchlist=tp_watchlist)
         st.session_state["tp_results"] = tp_res
         st.session_state["tp_err"] = tp_err
@@ -1399,15 +1470,15 @@ with tab5:
             st.markdown("<br>", unsafe_allow_html=True)
             st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(tp_results)} con · Sắp xếp theo Score (dốc + xăng + volume nở)</div>', unsafe_allow_html=True)
 
-            htp = st.columns([1, 1.7, 1.1, 0.9, 1.5, 1, 0.8, 1.9, 0.9])
-            for col, h in zip(htp, ["Sàn", "Symbol", "Giá", "RSI", "Trạng thái 2MA", "Xăng%", "C↑", "Tín hiệu", "Score"]):
+            htp = st.columns([1, 1.7, 1.1, 0.9, 1.9, 1, 0.8, 1.9, 0.9])
+            for col, h in zip(htp, ["Sàn", "Symbol", "Giá", "RSI", "Cung · mạnh · nở", "Xăng%", "A'", "Tín hiệu", "Score"]):
                 col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
 
             def _fp2(v):
                 return f"${v:.6f}" if v < 0.01 else f"${v:.4f}" if v < 1 else f"${v:.2f}"
 
             for it in tp_results:
-                cols = st.columns([1, 1.7, 1.1, 0.9, 1.5, 1, 0.8, 1.9, 0.9])
+                cols = st.columns([1, 1.7, 1.1, 0.9, 1.9, 1, 0.8, 1.9, 0.9])
                 ex = it.get("exchange", "")
                 exb = "badge-mexc" if ex == "MEXC" else "badge-gate"
                 cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {exb}">{ex}</span></div>', unsafe_allow_html=True)
@@ -1417,10 +1488,18 @@ with tab5:
                 rsi_c = "#f85149" if it["rsi"] >= 80 else "#3fb950" if it["rsi"] >= 60 else "#8b949e"
                 qt = " ⚡" if it["quan_tinh"] else ""
                 cols[3].markdown(f'<div style="padding-top:8px;color:{rsi_c};font-weight:600;">{it["rsi"]:.0f}{qt}</div>', unsafe_allow_html=True)
-                cols[4].markdown(f'<div style="padding-top:8px;font-size:0.78rem;color:#3fb950;">▲ TĂNG<span style="color:#8b949e;"> · mở {it["spread"]:.1f} · dốc {it["slope"]:+.2f}</span></div>', unsafe_allow_html=True)
+                _no = "▲mở" if it["no_rong"] > 0 else "▼khép" if it["no_rong"] < 0 else "—"
+                _noc = "#3fb950" if it["no_rong"] > 0 else "#f85149" if it["no_rong"] < 0 else "#8b949e"
+                _mo = f'{it["rsi_mo"]:.0f}' if it.get("rsi_mo") is not None else "—"
+                cols[4].markdown(
+                    f'<div style="padding-top:8px;font-size:0.76rem;">'
+                    f'<span style="color:#8b949e;">mở </span><b style="color:#e6edf3;">{_mo}</b>'
+                    f'<span style="color:#8b949e;"> · m</span><b style="color:#58a6ff;">{it["manh"]:.0f}%</b>'
+                    f'<span style="color:{_noc};"> · {_no}</span></div>', unsafe_allow_html=True)
                 fuel_c = "#f85149" if it["fuel"] <= tp_fuel_low else "#3fb950" if it["fuel"] >= 50 else "#d29922"
                 cols[5].markdown(f'<div style="padding-top:8px;color:{fuel_c};font-weight:600;">{it["fuel"]:.0f}%</div>', unsafe_allow_html=True)
-                cols[6].markdown(f'<div style="padding-top:8px;">{"🟢" if it["c_up"] else "—"}</div>', unsafe_allow_html=True)
+                _tu = it.get("tuoi_cung", 999)
+                cols[6].markdown(f'<div style="padding-top:8px;font-size:0.8rem;color:#a371f7;">{_tu if _tu < 99 else "—"}</div>', unsafe_allow_html=True)
                 cols[7].markdown(f'<div style="padding-top:8px;font-size:0.8rem;color:{it["signal_color"]};">{it["signal"]}</div>', unsafe_allow_html=True)
                 sc_c = "#3fb950" if it["score"] >= 60 else "#d29922" if it["score"] >= 40 else "#8b949e"
                 cols[8].markdown(f'<div style="padding-top:8px;font-weight:700;color:{sc_c};">{it["score"]}</div>', unsafe_allow_html=True)
