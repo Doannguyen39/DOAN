@@ -633,208 +633,67 @@ def scan_wick_hunter(rank_start=100, rank_end=600, tf_minutes=15, scan_mexc=True
     return results[:80], None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TREND SẮP PUMP SCANNER — Tầng LỰC K23 (RSI14 + EMA9/WMA45) trên MEXC + Gate
+# 📐 MÔ HÌNH K23 — chạy ĐÚNG cổng `cong_vao()` của bot RSI (03/10, Kevin CODE ĐI)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Tham số CỨNG trích từ k23_core_v2.pine / k23_v3.pine (buổi 3-5) — KHÔNG bịa:
-#   RSI length = 14 · EMA nhanh = 9 · WMA chậm = 45 (đặt trên RSI)
-#   Mốc quán tính 80/20 (b4) · vùng 40-60 = sideway không vào (b3, note 01)
-# Mấy số minSpread/minSlope/... pine của Kevin ghi "không nguồn — chỉnh mắt" → để slider.
-K23_RSI_LEN = 14
-K23_EMA_LEN = 9
-K23_WMA_LEN = 45
-K23_INERT_UP = 80.0   # quán tính tăng (cứng b4)
-K23_INERT_DN = 20.0   # quán tính giảm (cứng b4)
+# 4 file k23_v7 · k23_dakhung · k23_engine · tuong_quan là BẢN CHÉP NGUYÊN từ repo BOT RSI
+# (commit e777570, 03/10). KHÔNG sửa ở đây — bot đổi luật thì chép lại cả 4 file.
+# Thay tab "🚀 Trend Sắp Pump" (30/08): luật cũ "cung mở ngoài 40–60" đã bị bác 13/09 và
+# Score theo độ mạnh/nở/xăng là thước sức mạnh — luật hiện tại chỉ LIỆT KÊ, không chấm điểm.
+try:
+    import k23_v7 as K23
+    K23_LOI = None
+except Exception as _e:          # thiếu file chép -> tab báo lỗi, các tab khác vẫn chạy
+    K23, K23_LOI = None, str(_e)
 
-def _wilder_rsi(closes, length=14):
-    """RSI Wilder (khớp ta.rsi của TradingView — dùng RMA). Trả np.array cùng độ dài, đầu NaN."""
-    c = np.asarray(closes, dtype=float)
-    n = len(c)
-    rsi = np.full(n, np.nan)
-    if n <= length:
-        return rsi
-    delta = np.diff(c)
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    avg_g = gain[:length].mean()
-    avg_l = loss[:length].mean()
-    rsi[length] = 100.0 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l)
-    for i in range(length + 1, n):
-        avg_g = (avg_g * (length - 1) + gain[i - 1]) / length
-        avg_l = (avg_l * (length - 1) + loss[i - 1]) / length
-        rsi[i] = 100.0 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l)
-    return rsi
+K23_SO_NEN = 300   # đủ khởi động WMA45 trên RSI (14+45) + vòng cung X ≥ 28 + cú A trước cung
+                   # — số MÌNH ĐẶT (bot dùng 400 nến); thiếu nến thì cong_vao báo "không có mô hình"
 
-def _ema_series(vals, length):
-    """EMA hồi quy (alpha=2/(n+1)), seed = giá trị hợp lệ đầu tiên. Khớp ta.ema."""
-    out = np.full(len(vals), np.nan)
-    alpha = 2.0 / (length + 1)
-    prev = None
-    for i, v in enumerate(vals):
-        if np.isnan(v):
-            continue
-        prev = v if prev is None else alpha * v + (1 - alpha) * prev
-        out[i] = prev
-    return out
+def _bars_mexc(symbol, interval, limit=K23_SO_NEN):
+    """Nến MEXC spot dạng bot: [[ts, o, h, l, c, v], …] cũ→mới. Plain (gọi được từ thread)."""
+    try:
+        r = requests.get(f"{MEXC_BASE}/klines",
+                         params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=8)
+        if r.status_code == 200:
+            d = r.json()
+            return [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in d]
+    except Exception:
+        pass
+    return None
 
-def _wma_series(vals, length):
-    """WMA trọng số 1..length (mới nhất nặng nhất). Khớp ta.wma."""
-    out = np.full(len(vals), np.nan)
-    w = np.arange(1, length + 1)
-    ws = w.sum()
-    for i in range(length - 1, len(vals)):
-        win = vals[i - length + 1:i + 1]
-        if np.any(np.isnan(win)):
-            continue
-        out[i] = float(np.dot(win, w) / ws)
-    return out
+def _bars_gate(symbol, interval, limit=K23_SO_NEN):
+    """Nến Gate spot dạng bot. ⚠️ Cột Gate: [ts, quote_vol, CLOSE, HIGH, LOW, OPEN, base_vol, closed]."""
+    try:
+        r = requests.get(f"{GATE_BASE}/spot/candlesticks",
+                         params={"currency_pair": symbol, "interval": interval, "limit": limit}, timeout=8)
+        if r.status_code == 200:
+            d = sorted(r.json(), key=lambda c: int(c[0]))
+            return [[int(c[0]) * 1000, float(c[5]), float(c[3]), float(c[4]), float(c[2]), float(c[1])] for c in d]
+    except Exception:
+        pass
+    return None
 
-def analyze_trend_pump(kdata, p):
-    """
-    Tầng 1 (MÁY): lọc theo QUY LUẬT 1 của thầy — "có mô hình thì vào, không có thì thôi" (b8 33:23).
-    Tầng 2 (BÀY): RSI · độ mạnh · nở · xăng · A' để MẮT Kevin canh điểm vào.
-    Chỉ tính nến ĐÓNG (b3) → dùng nến áp chót.
+# trạng thái -> (thứ tự hiện, màu). Đọc từ ký hiệu đầu câu `ly_do` của cong_vao — không tự phán.
+K23_NHOM = {"🟢": (0, "#3fb950"), "⏳": (1, "#d29922"), "🔵": (2, "#58a6ff"),
+            "❌": (3, "#f85149"), "⛔": (3, "#f85149"), "⚪": (4, "#8b949e"), "⚠️": (4, "#8b949e")}
 
-    Hai chế độ:
-      "tre"    — con ĐÃ có trend tăng xác nhận (bắt trễ, an toàn hơn)
-      "apham"  — con vừa có A': cung tích lũy MỚI ĐÓNG, xăng còn nhiều (bắt sớm — tìm gem)
-    """
-    closes = kdata["closes"]; highs = kdata["highs"]; lows = kdata["lows"]; vols = kdata["volumes"]
-    n = len(closes)
-    if n < K23_RSI_LEN + K23_WMA_LEN + 5:
+def k23_mot_coin(bars):
+    """Gọi cong_vao trên nến ĐÃ ĐÓNG (bỏ nến đang chạy). Trả dict để bày, hoặc None nếu không có mô hình."""
+    if not bars or len(bars) < 120:
         return None
-    rsiV = _wilder_rsi(closes, K23_RSI_LEN)
-    emaF = _ema_series(rsiV, K23_EMA_LEN)
-    wmaS = _wma_series(rsiV, K23_WMA_LEN)
-
-    i = n - 2  # nến ĐÓNG gần nhất
-    sb = p["slopeBars"]
-    if i - sb < 0 or np.isnan(emaF[i]) or np.isnan(wmaS[i]) or np.isnan(rsiV[i]) or np.isnan(emaF[i - sb]):
+    b = bars[:-1]
+    cv = K23.cong_vao(b)
+    if not cv.get("co"):
         return None
-    rsi_now = float(rsiV[i]); ema_now = float(emaF[i]); wma_now = float(wmaS[i])
-    spread = ema_now - wma_now
-    slope  = (emaF[i] - emaF[i - sb]) / sb
+    cg = cv.get("cung") or {}
+    ly = str(cv.get("ly_do") or "")
+    ky = next((k for k in K23_NHOM if ly.startswith(k)), "⚪")
+    f05, f618, f70 = (cv.get("fibo") or (None, None, None))[:3]
+    return {"current_price": b[-1][4], "chieu": cg.get("chuan_bi"), "x": cg.get("dai"),
+            "y": cg.get("bien_y"), "tuoi": len(b) - 1 - cg.get("i_cuoi", len(b) - 1),
+            "ly_do": ly, "ky": ky, "thu_tu": K23_NHOM[ky][0], "mau": K23_NHOM[ky][1],
+            "f05": f05, "f618": f618, "f70": f70, "vao": bool(cv.get("vao"))}
 
-    # ── ĐỘ MẠNH TƯƠNG ĐỐI thay 2 ngưỡng tuyệt đối cũ (minSpread 2.0 / minSlope 0.10 — SỐ BỊA).
-    #    Thầy KHÔNG cho ngưỡng "mở rộng bao nhiêu là đủ" (b15), và ở b4 2:13 thầy còn bác thẳng
-    #    cách lượng hoá bằng chênh lệch WMA45 ("ngay cả mô hình số 7 cũng không hề mạnh").
-    #    Nên đo |EMA-WMA| so với CHÍNH lịch sử con đó: 100% = rộng nhất từng thấy.
-    hist = np.abs(emaF - wmaS)
-    hist = hist[~np.isnan(hist)]
-    manh = 0.0
-    if len(hist) >= 20:
-        dinh = float(np.percentile(hist, 95))
-        if dinh > 0:
-            manh = min(100.0, abs(spread) / dinh * 100.0)
-    #    Hướng tính THUẦN theo vị trí 2 đường + dốc — KHÔNG áp ngưỡng số nào lên độ mạnh,
-    #    vì thầy không cho ngưỡng (b15) và đã bác cách lượng hoá đó (b4 2:13).
-    #    `manh` chỉ để BÀY cho mắt: 0% = quấn dây điện, 100% = rộng nhất từng thấy.
-    state = 1 if (ema_now > wma_now and slope > 0) else -1 if (ema_now < wma_now and slope < 0) else 0
-
-    # ── NỞ: cung đang MỞ RA hay KHÉP LẠI (b4 ~2:34) ──
-    #    "mở mở dần ra" = lực thuận tích lũy TĂNG · "thu hẹp dần" = lực ngược tích lũy.
-    #    Thiếu cái này thì chỉ biết cung RỘNG bao nhiêu, không biết đang ở NỬA NÀO.
-    nb = p["noBars"]
-    no_rong = 0.0
-    if i - nb >= 0 and not np.isnan(emaF[i - nb]) and not np.isnan(wmaS[i - nb]):
-        no_rong = abs(spread) - abs(float(emaF[i - nb]) - float(wmaS[i - nb]))
-
-    # ── VÒNG CUNG + QUY LUẬT 1 (b8 33:23) ──
-    #    Cung MUA mở tại EMA cắt XUỐNG, đóng tại cắt LÊN -> chuẩn bị sóng TĂNG.
-    #    ĐỦ BA điều kiện mới là mô hình: cung đã đóng · mở NGOÀI 40-60 · có dốc + mở rộng.
-    idx_xuong = idx_len = -1
-    for j in range(i, max(0, i - 300), -1):
-        if j < 1 or np.isnan(emaF[j - 1]) or np.isnan(wmaS[j - 1]):
-            continue
-        if idx_len < 0 and emaF[j - 1] <= wmaS[j - 1] and emaF[j] > wmaS[j]:
-            idx_len = j
-        if idx_xuong < 0 and emaF[j - 1] >= wmaS[j - 1] and emaF[j] < wmaS[j]:
-            idx_xuong = j
-        if idx_len >= 0 and idx_xuong >= 0:
-            break
-    cung_mua_dong = idx_len > idx_xuong >= 0          # cắt lên MỚI HƠN cắt xuống
-    idx_mo   = idx_xuong if cung_mua_dong else idx_len
-    idx_dong = idx_len if cung_mua_dong else idx_xuong
-    rsi_mo   = float(rsiV[idx_mo]) if idx_mo >= 0 and not np.isnan(rsiV[idx_mo]) else None
-    rsi_dong = float(rsiV[idx_dong]) if idx_dong >= 0 and not np.isnan(rsiV[idx_dong]) else None
-    tuoi_cung = (i - idx_dong) if idx_dong >= 0 else 999
-    chuan_bi = 1 if cung_mua_dong else -1
-
-    ngoai_vung = rsi_mo is not None and (rsi_mo < 40 or rsi_mo > 60)
-    co_mo_hinh = bool(ngoai_vung and state != 0 and idx_dong >= 0)
-
-    # ⭐ QUY LUẬT 1 — không có mô hình thì loại thẳng, không cần xét gì thêm
-    if not co_mo_hinh:
-        return None
-
-    # ── XĂNG đo từ điểm KẾT THÚC vòng cung = điểm A' (b2 1:23 · Kevin chốt) ──
-    #    Trước đây tính (80 - RSI)/(80 - 20) là đo trên TOÀN DẢI — sai mốc xuất phát.
-    if chuan_bi == 1:
-        goc = rsi_dong if rsi_dong is not None else K23_INERT_DN
-        fuel = (K23_INERT_UP - rsi_now) / max(1e-9, K23_INERT_UP - goc) * 100
-    else:
-        goc = rsi_dong if rsi_dong is not None else K23_INERT_UP
-        fuel = (rsi_now - K23_INERT_DN) / max(1e-9, goc - K23_INERT_DN) * 100
-    fuel = max(0.0, min(100.0, fuel))
-    quan_tinh = rsi_now >= K23_INERT_UP
-
-    look = p["priceLook"]
-    if i - look < 0 or closes[i - look] <= 0:
-        return None
-    price_chg = (closes[i] / closes[i - look] - 1) * 100
-    seg_hi = max(highs[i - look:i + 1]); seg_lo = min(lows[i - look:i + 1]); seg_span = seg_hi - seg_lo
-    pos = (closes[i] - seg_lo) / seg_span * 100 if seg_span > 0 else 50.0
-
-    # ── LỌC theo chế độ ──
-    if p["mode"] == "tre":
-        # bắt trễ: trend TĂNG đã xác nhận
-        if state != 1 or rsi_now < p["rsiMinForce"] or price_chg < p["minTrendPct"]:
-            return None
-    else:
-        # bắt A' (tìm gem): cung chuẩn bị TĂNG vừa đóng, còn xăng, giá chưa chạy xa
-        if chuan_bi != 1:
-            return None
-        if tuoi_cung > p["apBars"]:
-            return None
-        if fuel < p["apFuelMin"]:
-            return None
-        if price_chg > p["apMaxRun"]:
-            return None
-
-    vr_recent = sum(vols[i - 2:i + 1]) / 3 if i >= 2 else vols[i]
-    seg_v = vols[max(0, i - look):i + 1]
-    vr_all = sum(seg_v) / len(seg_v) if seg_v else 0
-    vol_ratio = vr_recent / vr_all if vr_all > 0 else 0
-    c_up = cung_mua_dong and tuoi_cung <= p["cBars"]
-
-    if fuel <= p["fuelLow"]:
-        signal, signal_color = "⚠️ XĂNG CẠN · canh đảo", "#f85149"
-    elif p["mode"] == "apham":
-        signal, signal_color = f"🎯 A' cách {tuoi_cung} nến · xăng {fuel:.0f}%", "#a371f7"
-    elif c_up:
-        signal, signal_color = "🟢 C lên · còn xăng", "#3fb950"
-    else:
-        signal, signal_color = "⚪ Trend tăng · theo dõi", "#8b949e"
-
-    score = 0.0
-    score += min(25, manh * 0.25)                     # độ mạnh tương đối
-    score += min(20, max(0, no_rong) * 2)             # đang MỞ RA
-    score += min(20, fuel * 0.20)                     # còn xăng
-    score += min(15, max(0, (vol_ratio - 1)) * 30)    # volume nở
-    score += min(10, max(0, 10 - tuoi_cung))          # A' còn tươi
-    score += 10 if c_up else 0
-
-    return {
-        "current_price": closes[i], "rsi": rsi_now, "state": state,
-        "spread": spread, "slope": slope, "manh": manh, "no_rong": no_rong,
-        "fuel": fuel, "quan_tinh": quan_tinh, "vol_ratio": vol_ratio,
-        "price_chg": price_chg, "pos_in_range": pos, "c_up": c_up,
-        "rsi_mo": rsi_mo, "rsi_dong": rsi_dong, "tuoi_cung": tuoi_cung,
-        "chuan_bi": chuan_bi, "co_mo_hinh": co_mo_hinh,
-        "signal": signal, "signal_color": signal_color, "score": round(score, 1),
-    }
-
-def _scan_exchange_tp(pairs, fetch_fn, exchange_name, wl, workers, p):
-    """Quét 1 sàn cho trend-pump, song song."""
+def _scan_exchange_k23(pairs, fetch_fn, exchange_name, wl, workers):
     out = []
     if not pairs:
         return out
@@ -843,71 +702,47 @@ def _scan_exchange_tp(pairs, fetch_fn, exchange_name, wl, workers, p):
         for fut in as_completed(fut_map):
             sym = fut_map[fut]
             try:
-                kdata = fut.result()
+                res = k23_mot_coin(fut.result())
             except Exception:
                 continue
-            if not kdata:
-                continue
-            res = analyze_trend_pump(kdata, p)
             if res:
-                res["symbol"] = sym
-                res["exchange"] = exchange_name
-                res["watched"] = _wl_hit(sym, wl)
+                res["symbol"], res["exchange"], res["watched"] = sym, exchange_name, _wl_hit(sym, wl)
                 out.append(res)
     return out
 
+# khung -> (interval MEXC spot, interval Gate spot) — chỉ khung CẢ HAI sàn đều có sẵn
+K23_KHUNG = {"M15": ("15m", "15m"), "M30": ("30m", "30m"), "H1": ("60m", "1h"),
+             "H4": ("4h", "4h"), "D": ("1d", "1d")}
+
 @st.cache_data(ttl=300)
-def scan_trend_pump(rank_start=100, rank_end=600, tf_minutes=240, scan_mexc=True, scan_gate=True,
-                    rsiMinForce=55.0, manhSide=30.0, noBars=6, slopeBars=3,
-                    minTrendPct=3.0, priceLook=20, fuelLow=25.0, cBars=3,
-                    mode="tre", apBars=12, apFuelMin=40.0, apMaxRun=20.0, watchlist=()):
-    """Quét trend sắp pump MEXC + Gate. Lấy 150 nến để đủ warmup WMA45 trên RSI."""
-    results = []
-    any_pairs = False
+def scan_k23(rank_start=100, rank_end=600, khung="H4", scan_mexc=True, scan_gate=True, watchlist=()):
+    """LIỆT KÊ coin CÓ MÔ HÌNH K23 (cong_vao co=True) trên MEXC + Gate. Không chấm điểm."""
+    if K23 is None:
+        return [], f"Thiếu 4 file k23 trong repo: {K23_LOI}"
+    results, any_pairs = [], False
     wl = set(s.strip().upper().replace("_", "") for s in watchlist if s.strip())
-    p = {"rsiMinForce": rsiMinForce, "manhSide": manhSide, "noBars": noBars,
-         "slopeBars": slopeBars, "minTrendPct": minTrendPct, "priceLook": priceLook,
-         "fuelLow": fuelLow, "cBars": cBars, "mode": mode,
-         "apBars": apBars, "apFuelMin": apFuelMin, "apMaxRun": apMaxRun}
-
-    mexc_interval = f"{tf_minutes}m" if tf_minutes < 60 else "60m" if tf_minutes == 60 else "4h" if tf_minutes == 240 else "1d"
-    gate_interval = f"{tf_minutes}m" if tf_minutes < 60 else "1h" if tf_minutes == 60 else "4h" if tf_minutes == 240 else "1d"
-
-    if scan_mexc:
-        pairs = get_mexc_usdt_pairs()
-        if pairs:
-            any_pairs = True
-            pairs = [x for x in pairs if not any(s in x for s in SKIP_COINS) and not _is_leveraged(x)]
-            vols  = get_mexc_volumes()
-            wl_p  = [x for x in pairs if _wl_hit(x, wl)]
-            rest  = [x for x in pairs if not _wl_hit(x, wl)]
-            if vols:
-                rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
-            rest  = rest[rank_start:rank_end]
-            pairs = wl_p + rest
-            fetch = lambda s: get_mexc_klines(s, interval=mexc_interval, limit=150)
-            results += _scan_exchange_tp(pairs, fetch, "MEXC", wl, WORKERS_MEXC, p)
-
-    if scan_gate:
-        pairs = get_gate_usdt_pairs()
-        if pairs:
-            any_pairs = True
-            pairs = [x for x in pairs if not any(s in x for s in SKIP_COINS) and not _is_leveraged(x)]
-            vols  = get_gate_volumes()
-            wl_p  = [x for x in pairs if _wl_hit(x, wl)]
-            rest  = [x for x in pairs if not _wl_hit(x, wl)]
-            if vols:
-                rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
-            rest  = rest[rank_start:rank_end]
-            pairs = wl_p + rest
-            fetch = lambda s: get_gate_klines(s, interval=gate_interval, limit=150)
-            results += _scan_exchange_tp(pairs, fetch, "Gate", wl, WORKERS_GATE, p)
-
+    itv_m, itv_g = K23_KHUNG[khung]
+    for bat, lay_pairs, lay_vol, fetch, ten, workers in (
+            (scan_mexc, get_mexc_usdt_pairs, get_mexc_volumes, lambda s: _bars_mexc(s, itv_m), "MEXC", WORKERS_MEXC),
+            (scan_gate, get_gate_usdt_pairs, get_gate_volumes, lambda s: _bars_gate(s, itv_g), "Gate", WORKERS_GATE)):
+        if not bat:
+            continue
+        pairs = lay_pairs()
+        if not pairs:
+            continue
+        any_pairs = True
+        pairs = [x for x in pairs if not any(s in x for s in SKIP_COINS) and not _is_leveraged(x)]
+        vols = lay_vol()
+        wl_p = [x for x in pairs if _wl_hit(x, wl)]
+        rest = [x for x in pairs if not _wl_hit(x, wl)]
+        if vols:
+            rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
+        results += _scan_exchange_k23(wl_p + rest[rank_start:rank_end], fetch, ten, wl, workers)
     if not any_pairs:
         return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
-
-    results.sort(key=lambda x: (not x.get("watched", False), -x["score"]))
-    return results[:80], None
+    # xếp theo TRẠNG THÁI (🟢 → ⏳ → 🔵 → ❌), trong nhóm: cung đóng gần nhất lên trước — không phải điểm
+    results.sort(key=lambda x: (not x["watched"], x["thu_tu"], x["tuoi"]))
+    return results, None          # trả ĐỦ — đếm trạng thái trên toàn bộ, chỉ cắt lúc HIỆN
 
 def analyze_narrative(gainers):
     nmap={"artificial-intelligence":"🤖 AI / Agent","ai":"🤖 AI / Agent","agent":"🤖 AI / Agent",
@@ -1108,7 +943,7 @@ if search_btn and query:
 
 # ─── TABS ─────────────────────────────────────────────────────────────────────
 st.markdown("<br><hr style='border-color:#21262d;'><br>", unsafe_allow_html=True)
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Trending", "💎 Micro-cap <$5M", "🔍 Narrative Scanner", "🎣 Câu Râu", "🚀 Trend Sắp Pump"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Trending", "💎 Micro-cap <$5M", "🔍 Narrative Scanner", "🎣 Câu Râu", "📐 Mô hình K23"])
 
 with tab1:
     trending=get_trending()
@@ -1364,146 +1199,94 @@ with tab4:
 with tab5:
     st.markdown("""
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
-        <div style="font-weight:600;color:#e6edf3;">🚀 Trend Sắp Pump — tầng LỰC K23</div>
+        <div style="font-weight:600;color:#e6edf3;">📐 Mô hình K23 — cùng cổng với bot RSI</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
-            Tầng 1 (máy): <b>QUY LUẬT 1 của thầy</b> — "có mô hình thì vào, không có thì thôi" (b8 33:23).
-            Mô hình cần ĐỦ BA: cung đã đóng · mở <b>NGOÀI 40–60</b> · có dốc + mở rộng.
-            Tầng 2 (bày): RSI · độ mạnh · nở · xăng · A' để <b>mắt Kevin canh điểm vào</b>.
-            MEXC + Gate · nến ĐÓNG · Cache 5 phút.
+            Liệt kê coin <b>CÓ MÔ HÌNH</b> theo luật thầy Alden: vòng cung = đúng 2 lần EMA9 cắt WMA45, X ≥ 28 nến, Y ≥ 24 điểm RSI.
+            Trạng thái lấy nguyên câu của bot: 🟢 trong vùng vào · ⏳ chờ về vùng 0.5–0.618 · 🔵 sóng mới (chưa có vùng) · ❌ hỏng.
+            MEXC + Gate · nến ĐÓNG · không chấm điểm · Cache 5 phút.
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="warning">🧠 Tool chỉ <b>BÀY</b> RSI + 2 MA + xăng. <b>Phân kỳ 2 đỉnh/đáy để MẮT Kevin đọc</b> — máy không auto-lọc (bài học note 40/L13: máy so pivot kề → bắn sớm dính sweep). "Xăng cạn = canh ĐẢO", không phải chỗ long mới.</div>', unsafe_allow_html=True)
-
-    tp_mode_label = st.radio(
-        "Chế độ săn", ["🎯 Bắt A' — cung vừa đóng, sắp chạy (tìm gem)", "🐢 Bắt trễ — trend đã xác nhận"],
-        index=0, horizontal=True, key="tp_mode",
-        help="A' (b2 1:23) = điểm giá DỪNG GIẢM và bắt đầu tăng — chỗ thầy dạy mua. "
-             "Bắt trễ = chờ trend xác nhận rồi mới vào, an toàn hơn nhưng vị thế xấu hơn.")
-    tp_mode = "apham" if tp_mode_label.startswith("🎯") else "tre"
-
-    ce1, ce2, ce3 = st.columns([1.2, 1.2, 1.6])
+    ce1, ce2, ce3, ce4 = st.columns([1, 1, 1.3, 1.5])
     with ce1:
-        tp_mexc = st.checkbox("MEXC", value=True, key="tp_mexc")
+        tp_mexc = st.checkbox("MEXC", value=True, key="k23_mexc")
     with ce2:
-        tp_gate = st.checkbox("Gate.io", value=True, key="tp_gate")
+        tp_gate = st.checkbox("Gate.io", value=True, key="k23_gate")
     with ce3:
-        tp_tf_label = st.selectbox("Khung đọc trend", ["H1", "H4", "D"], index=1, key="tp_tf",
-            help="Hướng theo khung lớn (b12). H4 cân bằng. Điểm vào chính xác canh khung nhỏ hơn.")
-    tp_tf_map = {"H1": 60, "H4": 240, "D": 1440}
-    tp_tf_minutes = tp_tf_map[tp_tf_label]
+        k23_khung = st.selectbox("Khung có mô hình", list(K23_KHUNG), index=3, key="k23_khung",
+            help="Khung đi săn mô hình. Vào lệnh ở khung nhỏ hơn (bóc dần, b27).")
+    with ce4:
+        k23_chieu = st.radio("Chiều", ["Cả hai", "∪ TĂNG", "∩ GIẢM"], index=0, horizontal=True, key="k23_chieu")
 
-    tp_wl_raw = st.text_input(
-        "📌 Token ưu tiên (luôn scan — cách nhau dấu phẩy)",
-        placeholder="VD: KOMAUSDT, SIREN_USDT",
-        key="tp_watchlist")
+    tp_wl_raw = st.text_input("📌 Token ưu tiên (luôn scan — cách nhau dấu phẩy)",
+                              placeholder="VD: GRAMUSDT, UNI_USDT", key="k23_watchlist")
     tp_watchlist = tuple(s.strip().upper() for s in tp_wl_raw.split(",") if s.strip())
-
-    cc1, cc2, cc3, cc4 = st.columns(4)
-    if tp_mode == "apham":
-        with cc1:
-            tp_ap_bars = st.slider("A' còn tươi trong (nến)", 1, 30, 12, 1,
-                help="Cung tích lũy đóng cách đây bao nhiêu nến thì còn coi là A' mới. Càng nhỏ càng sát điểm vào.")
-        with cc2:
-            tp_ap_fuel = st.slider("Xăng tối thiểu (%)", 20.0, 90.0, 40.0, 5.0,
-                help="Dư địa RSI từ điểm A' tới mốc 80. Thấp quá thì sóng đã chạy gần hết.")
-        tp_rsi_min, tp_trend_pct = 0.0, -999.0
-    else:
-        with cc1:
-            tp_rsi_min = st.slider("RSI tối thiểu (lực mua)", 50.0, 75.0, 55.0, 1.0,
-                help="≥ mốc này mới coi là lực mua thật. Cao hơn = chắc nhưng vào trễ hơn.")
-        with cc2:
-            tp_trend_pct = st.slider("Đà giá tối thiểu (%)", 0.0, 30.0, 3.0, 0.5,
-                help="Giá phải tăng ≥ mức này trong 20 nến gần nhất → xác nhận đang trend.")
-        tp_ap_bars, tp_ap_fuel = 12, 40.0
-    with cc3:
-        tp_fuel_low = st.slider("Ngưỡng xăng cạn (%)", 5.0, 50.0, 25.0, 1.0,
-            help="Dư địa RSI tới 80 dưới mức này → cảnh báo KIỆT (canh đảo, không phải long mới). Số 'không nguồn — chỉnh mắt' theo pine Kevin.")
-    with cc4:
-        tp_band = st.slider("Dải hạng volume (né top)", 0, 1500, (100, 600), 50,
-            help="Bỏ N coin top → quét dải lowcap (giống Range Bot).")
-        tp_rank_start, tp_rank_end = tp_band
-
-    st.markdown('<div style="color:#8b949e;font-size:0.78rem;margin-top:4px;">💡 <b>Cung mở</b> = RSI lúc cung tích lũy bắt đầu — phải NGOÀI 40–60 mới tính là mô hình (b3 2:38). <b>m%</b> = độ mạnh so với chính lịch sử con đó (100% = rộng nhất từng thấy). <b>Nở</b> = cung đang mở ra hay khép lại (b4 2:34). <b>Xăng</b> đo từ điểm KẾT THÚC cung = điểm A\'. <b>A\'</b> = cung đóng cách đây mấy nến.</div>', unsafe_allow_html=True)
+    k23_band = st.slider("Dải hạng volume (né top)", 0, 1500, (100, 600), 50, key="k23_band",
+                         help="Bỏ N coin top → quét dải lowcap (giống Câu Râu).")
 
     cb1, cb2 = st.columns([1, 3])
     with cb1:
-        tp_scan_btn = st.button("🔄 Scan ngay", use_container_width=True, key="tp_scan_btn")
+        k23_btn = st.button("📐 Quét mô hình", use_container_width=True, key="k23_scan_btn")
     with cb2:
-        st.markdown('<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ Lấy 150 nến/con để tính RSI+MA · ~30-50s · Cache 5 phút · Chỉ chạy khi bấm</div>', unsafe_allow_html=True)
+        st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ {K23_SO_NEN} nến/con · ~40-80s · Cache 5 phút · Chỉ chạy khi bấm</div>', unsafe_allow_html=True)
 
-    if tp_scan_btn and (tp_mexc or tp_gate):
-        scan_trend_pump.clear()
-        with st.spinner(f"🔍 Đang lọc trend + tính RSI k23 · {tp_tf_label} · hạng {tp_rank_start}–{tp_rank_end}..."):
-            tp_res, tp_err = scan_trend_pump(
-                rank_start=tp_rank_start, rank_end=tp_rank_end, tf_minutes=tp_tf_minutes,
-                scan_mexc=tp_mexc, scan_gate=tp_gate,
-                rsiMinForce=tp_rsi_min, minTrendPct=tp_trend_pct, fuelLow=tp_fuel_low,
-                mode=tp_mode, apBars=tp_ap_bars, apFuelMin=tp_ap_fuel,
-                watchlist=tp_watchlist)
-        st.session_state["tp_results"] = tp_res
-        st.session_state["tp_err"] = tp_err
-        st.session_state["tp_loaded"] = True
+    if k23_btn and (tp_mexc or tp_gate):
+        scan_k23.clear()
+        with st.spinner(f"📐 Đang dò vòng cung · {k23_khung} · hạng {k23_band[0]}–{k23_band[1]}..."):
+            k_res, k_err = scan_k23(rank_start=k23_band[0], rank_end=k23_band[1], khung=k23_khung,
+                                    scan_mexc=tp_mexc, scan_gate=tp_gate, watchlist=tp_watchlist)
+        st.session_state["k23_results"], st.session_state["k23_err"] = k_res, k_err
+        st.session_state["k23_loaded"] = True
 
     if not tp_mexc and not tp_gate:
-        st.warning("⚠️ Chọn ít nhất 1 sàn để scan.")
-    elif not st.session_state.get("tp_loaded"):
-        st.info("Bấm **Scan ngay** để lọc con đang có trend tăng + bày RSI k23.")
+        st.warning("⚠️ Chọn ít nhất 1 sàn để quét.")
+    elif not st.session_state.get("k23_loaded"):
+        st.info("Bấm **Quét mô hình** để liệt kê coin có vòng cung K23. (Chỉ chạy khi bấm.)")
     else:
-        tp_results = st.session_state.get("tp_results", [])
-        tp_err = st.session_state.get("tp_err")
-        if tp_err:
-            st.error(f"Lỗi: {tp_err}")
-        elif not tp_results:
-            st.info("Không con nào đủ điều kiện 'trend TĂNG xác nhận'. Thị trường đang chỉnh/sideway → hạ RSI tối thiểu hoặc đà giá rồi scan lại.")
+        k_res = st.session_state.get("k23_results", [])
+        k_err = st.session_state.get("k23_err")
+        if k23_chieu != "Cả hai":
+            k_res = [r for r in k_res if r["chieu"] == (1 if k23_chieu.startswith("∪") else -1)]
+        if k_err:
+            st.error(f"Lỗi: {k_err}")
+        elif not k_res:
+            st.info("Không coin nào có mô hình ở khung này. Đổi khung hoặc mở rộng dải hạng rồi quét lại.")
         else:
-            n_fuel = sum(1 for r in tp_results if r["fuel"] > tp_fuel_low)
-            n_cup  = sum(1 for r in tp_results if r["c_up"])
-            n_kiet = sum(1 for r in tp_results if r["fuel"] <= tp_fuel_low)
-            mm1, mm2, mm3, mm4 = st.columns(4)
-            mm1.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#58a6ff">{len(tp_results)}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">TREND TĂNG</div></div>', unsafe_allow_html=True)
-            mm2.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#3fb950">{n_fuel}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">CÒN XĂNG</div></div>', unsafe_allow_html=True)
-            mm3.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#a371f7">{n_cup}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🟢 CÓ C↑</div></div>', unsafe_allow_html=True)
-            mm4.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#f85149">{n_kiet}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">⚠️ XĂNG CẠN</div></div>', unsafe_allow_html=True)
-
+            dem = {k: sum(1 for r in k_res if r["ky"] == k) for k in ("🟢", "⏳", "🔵")}
+            dem["❌"] = sum(1 for r in k_res if r["ky"] in ("❌", "⛔"))
+            mm = st.columns(4)
+            for col, (k, ten, mau) in zip(mm, [("🟢", "TRONG VÙNG VÀO", "#3fb950"), ("⏳", "CHỜ VỀ VÙNG", "#d29922"),
+                                               ("🔵", "SÓNG MỚI", "#58a6ff"), ("❌", "HỎNG", "#f85149")]):
+                col.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:{mau}">{dem[k]}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">{k} {ten}</div></div>', unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(tp_results)} con · Sắp xếp theo Score (dốc + xăng + volume nở)</div>', unsafe_allow_html=True)
+            K23_HIEN = 150   # số dòng vẽ ra (Streamlit vẽ từng dòng chậm) — số MÌNH ĐẶT, không phải luật
+            st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(k_res)} coin có mô hình'
+                        + (f' · hiện {K23_HIEN} dòng đầu' if len(k_res) > K23_HIEN else '')
+                        + ' · xếp theo trạng thái, trong nhóm cung đóng gần nhất lên trước</div>', unsafe_allow_html=True)
 
-            htp = st.columns([1, 1.7, 1.1, 0.9, 1.9, 1, 0.8, 1.9, 0.9])
-            for col, h in zip(htp, ["Sàn", "Symbol", "Giá", "RSI", "Cung · mạnh · nở", "Xăng%", "A'", "Tín hiệu", "Score"]):
+            hc = st.columns([0.9, 1.6, 1.1, 1.1, 1.2, 2.0, 3.4])
+            for col, h in zip(hc, ["Sàn", "Symbol", "Giá", "Cung", "Đóng cách", "Vùng vào · SL 0.7", "Bot nói"]):
                 col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
 
-            def _fp2(v):
-                return f"${v:.6f}" if v < 0.01 else f"${v:.4f}" if v < 1 else f"${v:.2f}"
+            def _fpk(v):
+                if v is None: return "—"
+                return f"{v:.4g}" if v < 0.01 else f"{v:.6g}"
 
-            for it in tp_results:
-                cols = st.columns([1, 1.7, 1.1, 0.9, 1.9, 1, 0.8, 1.9, 0.9])
-                ex = it.get("exchange", "")
-                exb = "badge-mexc" if ex == "MEXC" else "badge-gate"
-                cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {exb}">{ex}</span></div>', unsafe_allow_html=True)
-                star = "📌 " if it.get("watched") else ""
-                cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{star}{it["symbol"]}</div>', unsafe_allow_html=True)
-                cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{_fp2(it["current_price"])}</div>', unsafe_allow_html=True)
-                rsi_c = "#f85149" if it["rsi"] >= 80 else "#3fb950" if it["rsi"] >= 60 else "#8b949e"
-                qt = " ⚡" if it["quan_tinh"] else ""
-                cols[3].markdown(f'<div style="padding-top:8px;color:{rsi_c};font-weight:600;">{it["rsi"]:.0f}{qt}</div>', unsafe_allow_html=True)
-                _no = "▲mở" if it["no_rong"] > 0 else "▼khép" if it["no_rong"] < 0 else "—"
-                _noc = "#3fb950" if it["no_rong"] > 0 else "#f85149" if it["no_rong"] < 0 else "#8b949e"
-                _mo = f'{it["rsi_mo"]:.0f}' if it.get("rsi_mo") is not None else "—"
-                cols[4].markdown(
-                    f'<div style="padding-top:8px;font-size:0.76rem;">'
-                    f'<span style="color:#8b949e;">mở </span><b style="color:#e6edf3;">{_mo}</b>'
-                    f'<span style="color:#8b949e;"> · m</span><b style="color:#58a6ff;">{it["manh"]:.0f}%</b>'
-                    f'<span style="color:{_noc};"> · {_no}</span></div>', unsafe_allow_html=True)
-                fuel_c = "#f85149" if it["fuel"] <= tp_fuel_low else "#3fb950" if it["fuel"] >= 50 else "#d29922"
-                cols[5].markdown(f'<div style="padding-top:8px;color:{fuel_c};font-weight:600;">{it["fuel"]:.0f}%</div>', unsafe_allow_html=True)
-                _tu = it.get("tuoi_cung", 999)
-                cols[6].markdown(f'<div style="padding-top:8px;font-size:0.8rem;color:#a371f7;">{_tu if _tu < 99 else "—"}</div>', unsafe_allow_html=True)
-                cols[7].markdown(f'<div style="padding-top:8px;font-size:0.8rem;color:{it["signal_color"]};">{it["signal"]}</div>', unsafe_allow_html=True)
-                sc_c = "#3fb950" if it["score"] >= 60 else "#d29922" if it["score"] >= 40 else "#8b949e"
-                cols[8].markdown(f'<div style="padding-top:8px;font-weight:700;color:{sc_c};">{it["score"]}</div>', unsafe_allow_html=True)
+            for it in k_res[:K23_HIEN]:
+                cols = st.columns([0.9, 1.6, 1.1, 1.1, 1.2, 2.0, 3.4])
+                ex = it["exchange"]
+                cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {"badge-mexc" if ex == "MEXC" else "badge-gate"}">{ex}</span></div>', unsafe_allow_html=True)
+                cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{"📌 " if it["watched"] else ""}{it["symbol"]}</div>', unsafe_allow_html=True)
+                cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{_fpk(it["current_price"])}</div>', unsafe_allow_html=True)
+                _ch = '<span style="color:#3fb950;">∪ TĂNG</span>' if it["chieu"] == 1 else '<span style="color:#f85149;">∩ GIẢM</span>'
+                cols[3].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{_ch}<br><span style="color:#8b949e;">X{it["x"]} · Y{it["y"]}</span></div>', unsafe_allow_html=True)
+                cols[4].markdown(f'<div style="padding-top:8px;font-size:0.8rem;color:#a371f7;">{it["tuoi"]} nến</div>', unsafe_allow_html=True)
+                _vung = (f'{_fpk(it["f05"])} → {_fpk(it["f618"])}<br><span style="color:#f85149;">SL {_fpk(it["f70"])}</span>'
+                         if it["f05"] is not None else '<span style="color:#8b949e;">—</span>')
+                cols[5].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{_vung}</div>', unsafe_allow_html=True)
+                cols[6].markdown(f'<div style="padding-top:8px;font-size:0.78rem;color:{it["mau"]};">{it["ly_do"]}</div>', unsafe_allow_html=True)
 
-            st.markdown('<div class="warning">⚠️ Đây là danh sách ỨNG VIÊN có trend tăng — KHÔNG phải lệnh mua. Vào lệnh: chờ giá hồi (B) về vùng Fibo, MẮT đọc phân kỳ + C xác nhận, SL cấu trúc khung nhỏ. Xăng cạn (đỏ) = né, canh đảo.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="warning">⚠️ Đây là danh sách coin CÓ MÔ HÌNH — KHÔNG phải lệnh. Hướng + target ở khung có mô hình; vào lệnh ở khung nhỏ hơn (TH① phá cụm · TH② cấu trúc · TH③ retest), SL cấu trúc khung nhỏ, 1% tài khoản. Bot nói "hết đẹp" thì hạ kỳ vọng, mắt Kevin quyết.</div>', unsafe_allow_html=True)
 
 st.markdown('<br><div style="text-align:center;color:#484f58;font-size:0.78rem;padding:16px 0;">💎 Gem Hunter · CoinGecko + CoinMarketCap + MEXC + Gate.io · Research only</div>', unsafe_allow_html=True)
