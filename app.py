@@ -636,14 +636,15 @@ def scan_wick_hunter(rank_start=100, rank_end=600, tf_minutes=15, scan_mexc=True
 # 📐 MÔ HÌNH K23 — chạy ĐÚNG cổng `cong_vao()` của bot RSI (03/10, Kevin CODE ĐI)
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4 file k23_v7 · k23_dakhung · k23_engine · tuong_quan là BẢN CHÉP NGUYÊN từ repo BOT RSI
-# (commit e777570, 03/10). KHÔNG sửa ở đây — bot đổi luật thì chép lại cả 4 file.
+# (commit e777570, 03/10 — so lại 11/10: vẫn GIỐNG HỆT bot). KHÔNG sửa ở đây — bot đổi luật thì chép lại cả 4 file.
 # Thay tab "🚀 Trend Sắp Pump" (30/08): luật cũ "cung mở ngoài 40–60" đã bị bác 13/09 và
 # Score theo độ mạnh/nở/xăng là thước sức mạnh — luật hiện tại chỉ LIỆT KÊ, không chấm điểm.
 try:
     import k23_v7 as K23
+    import k23_dakhung as K23D   # rsi · EMA9 · WMA45 · gộp nến · KC/HT — dùng cho 🌊 Sóng 2 (11/10)
     K23_LOI = None
 except Exception as _e:          # thiếu file chép -> tab báo lỗi, các tab khác vẫn chạy
-    K23, K23_LOI = None, str(_e)
+    K23, K23D, K23_LOI = None, None, str(_e)
 
 K23_SO_NEN = 300   # đủ khởi động WMA45 trên RSI (14+45) + vòng cung X ≥ 28 + cú A trước cung
                    # — số MÌNH ĐẶT (bot dùng 400 nến); thiếu nến thì cong_vao báo "không có mô hình"
@@ -671,6 +672,70 @@ def _bars_gate(symbol, interval, limit=K23_SO_NEN):
     except Exception:
         pass
     return None
+
+def _bars_gop(fetch, symbol, interval, n, limit):
+    """Nến khung lớn sàn spot không có sẵn (H8 · H12) = gộp n nến nguồn. Nến gộp CUỐI chứa nến nguồn
+    đang chạy → để nguyên làm 'nến đang chạy' (bên gọi tự bỏ nến cuối như mọi khung khác)."""
+    b = fetch(symbol, interval, limit)
+    return K23D.gop_nen(b, n) if (b and n > 1) else b
+
+# ─── LỌC TRADFI (11/10, Kevin CODE ĐI) ───────────────────────────────────────────
+# Cổ phiếu · ETF · vàng · bạc token hoá (Ondo · xStock · PAX Gold…) KHÔNG phải crypto → lọc theo TÊN ĐẦY ĐỦ
+# sàn tự ghi (MEXC `fullName` · Gate `base_name`), không dùng danh sách tay. Cố ý KHÔNG lọc chữ "Trust"
+# (trúng Trust Wallet Token — crypto); quỹ iShares đã bắt bằng chữ "iShares". Cũng KHÔNG lọc chữ "Gold" trần —
+# trúng token game crypto (Adventure Gold · RuneScape Gold · Alaska Gold Rush); vàng/bạc token hoá chỉ là
+# PAX Gold · Tether Gold · KAG "SILVER" (quỹ vàng còn lại đã dính iShares · SPDR · xStock · ETF). Soát tên thật 11/10.
+TRADFI_TEN = re.compile(r"\(Ondo\)|Ondo Tokenized|xStock|\bETF\b|\biShares\b|\bSPDR\b|\b(?:PAX|Tether)\s+Gold\b|^\s*SILVER\s*$"
+                        r"|,\s*Inc\.?|\bSpaceX\b|\bOpenAI\b|\bAnthropic\b|\bDatabricks\b", re.I)   # + cổ phiếu chưa niêm yết của Gate
+TRADFI_FIAT = {"BRL", "BRZ", "EUR", "EURC", "EURT", "EURI", "TRY", "GBP", "JPY", "AUD", "CAD", "CHF", "IDR", "NGN", "ARS", "MXN", "ZAR"}
+TRADFI_DUOI = ("ON", "X", "G")   # hậu tố token cổ phiếu: Ondo · xStock · Gate
+
+@st.cache_data(ttl=3600)
+def get_tradfi_symbols():
+    """Tập symbol TradFi của cả hai sàn: {'AAPLONUSDT', 'PAXG_USDT', …}.
+    Lượt 1 theo tên. Lượt 2 theo MÃ GỐC: sàn có lúc ghi thiếu (METAON chỉ ghi "Meta Platforms") — mã gốc META đã có
+    METAX là xStock thì mọi biến thể META+ON/X/G đều là TradFi. Mã gốc phải ≥ 3 ký tự để khỏi trúng coin ngắn."""
+    ten, nhan = {}, set()
+    try:
+        r = requests.get(f"{MEXC_BASE}/exchangeInfo", timeout=15)
+        if r.status_code == 200:
+            for s in r.json().get("symbols", []):
+                ten[s["symbol"]] = s.get("fullName") or ""
+                if "Tokenized Stocks" in (s.get("conceptPlates") or []):   # nhãn MEXC tự gắn — nguồn chuẩn nhất
+                    nhan.add(s["symbol"])                                   # (~60 mã Ondo tên không ghi "(Ondo)")
+    except Exception:
+        pass
+    try:
+        r = requests.get(f"{GATE_BASE}/spot/currency_pairs", timeout=20)
+        if r.status_code == 200:
+            ten.update({s["id"]: s.get("base_name") or "" for s in r.json()})
+    except Exception:
+        pass
+    out = nhan | {s for s, t in ten.items() if TRADFI_TEN.search(t) or _base_asset(s).upper() in TRADFI_FIAT}
+    goc = set()
+    for s in out:
+        b = _base_asset(s).upper()
+        for d in TRADFI_DUOI:
+            if b.endswith(d) and len(b) - len(d) >= 3:
+                goc.add(b[:-len(d)])
+    # chỉ sinh biến thể ON · G: xStock hai sàn luôn ghi chữ "xStock" (lượt 1 đã bắt), còn sinh "+X" thì
+    # trúng crypto trùng mã cổ phiếu (WMTX World Mobile Token · NETX) — soát tên thật 11/10
+    bien_the = {g + d for g in goc for d in ("ON", "G")}
+    out |= {s for s in ten if _base_asset(s).upper() in bien_the}
+    return out
+
+def _gop_san(results):
+    """Một coin có mô hình ở CẢ MEXC lẫn Gate → giữ MỘT dòng (dòng đến trước = MEXC), ghi thêm sàn kia."""
+    giu, out = {}, []
+    for r in results:
+        k = (_base_asset(r["symbol"]).upper(), r.get("tf", ""))
+        if k in giu:
+            giu[k]["san_kia"] = r["exchange"]
+            continue
+        r["san_kia"] = None
+        giu[k] = r
+        out.append(r)
+    return out
 
 # trạng thái -> (thứ tự hiện, màu). Đọc từ ký hiệu đầu câu `ly_do` của cong_vao — không tự phán.
 K23_NHOM = {"🟢": (0, "#3fb950"), "⏳": (1, "#d29922"), "🔵": (2, "#58a6ff"),
@@ -710,9 +775,10 @@ def _scan_exchange_k23(pairs, fetch_fn, exchange_name, wl, workers):
                 out.append(res)
     return out
 
-# khung -> (interval MEXC spot, interval Gate spot) — chỉ khung CẢ HAI sàn đều có sẵn
-K23_KHUNG = {"M15": ("15m", "15m"), "M30": ("30m", "30m"), "H1": ("60m", "1h"),
-             "H4": ("4h", "4h"), "D": ("1d", "1d")}
+# khung -> (interval MEXC spot, interval Gate spot, số nến gộp). H8 · H12 hai sàn spot không có sẵn
+# → gộp từ 4H (11/10, Kevin chốt khung cú A 4H · 8H · 12H · 1D).
+K23_KHUNG = {"M15": ("15m", "15m", 1), "M30": ("30m", "30m", 1), "H1": ("60m", "1h", 1),
+             "H4": ("4h", "4h", 1), "H8": ("4h", "4h", 2), "H12": ("4h", "4h", 3), "D": ("1d", "1d", 1)}
 
 @st.cache_data(ttl=300)
 def scan_k23(rank_start=100, rank_end=600, khung="H4", scan_mexc=True, scan_gate=True, watchlist=()):
@@ -721,17 +787,19 @@ def scan_k23(rank_start=100, rank_end=600, khung="H4", scan_mexc=True, scan_gate
         return [], f"Thiếu 4 file k23 trong repo: {K23_LOI}"
     results, any_pairs = [], False
     wl = set(s.strip().upper().replace("_", "") for s in watchlist if s.strip())
-    itv_m, itv_g = K23_KHUNG[khung]
+    itv_m, itv_g, gop = K23_KHUNG[khung]
+    lim = min(1000, K23_SO_NEN * gop + gop)      # 1000 = trần số nến một lần gọi của cả hai sàn
+    tradfi = get_tradfi_symbols()
     for bat, lay_pairs, lay_vol, fetch, ten, workers in (
-            (scan_mexc, get_mexc_usdt_pairs, get_mexc_volumes, lambda s: _bars_mexc(s, itv_m), "MEXC", WORKERS_MEXC),
-            (scan_gate, get_gate_usdt_pairs, get_gate_volumes, lambda s: _bars_gate(s, itv_g), "Gate", WORKERS_GATE)):
+            (scan_mexc, get_mexc_usdt_pairs, get_mexc_volumes, lambda s: _bars_gop(_bars_mexc, s, itv_m, gop, lim), "MEXC", WORKERS_MEXC),
+            (scan_gate, get_gate_usdt_pairs, get_gate_volumes, lambda s: _bars_gop(_bars_gate, s, itv_g, gop, lim), "Gate", WORKERS_GATE)):
         if not bat:
             continue
         pairs = lay_pairs()
         if not pairs:
             continue
         any_pairs = True
-        pairs = [x for x in pairs if not any(s in x for s in SKIP_COINS) and not _is_leveraged(x)]
+        pairs = [x for x in pairs if not any(s in x for s in SKIP_COINS) and not _is_leveraged(x) and x not in tradfi]
         vols = lay_vol()
         wl_p = [x for x in pairs if _wl_hit(x, wl)]
         rest = [x for x in pairs if not _wl_hit(x, wl)]
@@ -740,9 +808,145 @@ def scan_k23(rank_start=100, rank_end=600, khung="H4", scan_mexc=True, scan_gate
         results += _scan_exchange_k23(wl_p + rest[rank_start:rank_end], fetch, ten, wl, workers)
     if not any_pairs:
         return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
+    results = _gop_san(results)   # MEXC quét trước nên dòng MEXC được giữ, Gate ghi vào "san_kia"
     # xếp theo TRẠNG THÁI (🟢 → ⏳ → 🔵 → ❌), trong nhóm: cung đóng gần nhất lên trước — không phải điểm
     results.sort(key=lambda x: (not x["watched"], x["thu_tu"], x["tuoi"]))
     return results, None          # trả ĐỦ — đếm trạng thái trên toàn bộ, chỉ cắt lúc HIỆN
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🌊 SÓNG 2 — LỰC MUA TẠM NGHỈ (Kevin chốt 11/10 · CODE ĐI · luật đủ ở vault note 52 mục "KEVIN CHỐT 11/10")
+# ═══════════════════════════════════════════════════════════════════════════════
+# Kevin: "nó đi sóng 1, chính là cú A, thì mình chờ B điều chỉnh để có C là entry ăn sóng 2" · kiểu 1–2 lệnh/tháng.
+#   cú A = đoạn EMA9 TRÊN WMA45 của RSI: cắt lên → cắt xuống (b10 0:40:31) · đỉnh RSI ≥ 80 = quán tính,
+#          lực mua áp đảo → "sóng B sẽ không điều chỉnh quá sâu" (b4 0:22:37 · b8 0:17:23)
+#   B    = từ cắt xuống tới cắt lên kế tiếp · RSI KHÔNG thủng 50 — LUÔN, cả sau C (Kevin 11/10 · b43 0:58:50)
+#          giá đi ngang = "sự tạm nghỉ của lực mua… không hề có sự tham gia của lực bán" (b2 2:32:34)
+#          ⚠️ KHÔNG qua cong_vao: cổng Y ≥ 24 loại đúng B nông nhất (NEAR 1D chart ghi "✕ X39 Y19") — Kevin chốt đường riêng
+#   giá B = fibo trên cú A: ≤ 0.5 bậc 1 "rất đẹp" (b8 0:18:12) · ≤ 0.618 bậc 2 · ≤ 0.7 bậc 3 "đã rất yếu" (b10 0:40:55) · thủng 0.7 loại
+#   C    = EMA9 cắt lại lên WMA45 (b15 1:23:25) · giá vượt đỉnh A sau C = đã chạy, lỡ (D4, Kevin 03/10)
+#   công tắc = các khung TRÊN khung cú A trong cụm 1D·2D·3D·1W (b7 0:44:44). KHÔNG dùng cụm 1H·4H·1D của bot:
+#          B của cú A 1D làm 1D ▼ → bot ra KỲ VỌNG− oan. Đồng thuận ▼ thì bỏ (b36 0:02:28 chiều ngược)
+#   TP1 = đỉnh A ("ít nhất về đỉnh cũ", b15) · đích = KC khung cú A phía trên đỉnh (b9 3:17) · R:R từ giữa vùng 0.5–0.618, SL 0.7
+SONG2_SO_NEN = 1000   # trần một lần gọi của cả hai sàn: 4H → 333 nến 12H · ngày → 142 tuần cho cụm 2D·3D
+
+def _song2_mot_khung(b, tf):
+    """Một khung, nến ĐÃ ĐÓNG. Trả dict trạng thái của cú A gần nhất có quán tính, hoặc None."""
+    c = [x[4] for x in b]
+    r = K23D.rsi(c, 14); f = K23D._ema(r, 9); s = K23D._wma(r, 45)
+    n = len(b); gia = b[-1][4]
+    cat = [i for i in range(1, n) if None not in (f[i - 1], s[i - 1], f[i], s[i]) and (f[i - 1] - s[i - 1]) * (f[i] - s[i]) < 0]
+    xuong = [i for i in cat if f[i] < s[i]]
+    for idn in reversed(xuong[-3:]):                  # lần cắt xuống mở B, xét lùi tối đa 3 đoạn (số mình đặt)
+        iu = max((i for i in cat if i < idn and f[i] > s[i]), default=None)
+        if iu is None:
+            continue
+        if max(x for x in r[iu:idn + 1] if x is not None) < 80:
+            continue                                   # cú A chưa có quán tính → xét đoạn trước
+        ic = min((i for i in cat if i > idn and f[i] > s[i]), default=None)
+        het_b = ic if ic is not None else n - 1
+        if min(r[idn:]) < 50:
+            return {"tf": tf, "loai": "RSI_THUNG_50"}
+        a0 = min(x[3] for x in b[max(0, iu - 3):idn + 1])
+        ih = max(range(iu, min(n, idn + 3)), key=lambda i: b[i][2]); a1 = b[ih][2]
+        A = a1 - a0
+        if A <= 0:
+            return None
+        day_b = min(x[3] for x in b[ih:het_b + 1])
+        sau = (a1 - day_b) / A * 100
+        f5, f618, f7 = a1 - .5 * A, a1 - .618 * A, a1 - .7 * A
+        if min(x[3] for x in b[ih:]) <= f7:
+            return {"tf": tf, "loai": "THUNG_07"}
+        if ic is not None and max(x[2] for x in b[ic:]) > a1:
+            return {"tf": tf, "loai": "D4_DA_CHAY"}
+        mid = (f5 + f618) / 2
+        kc = [m["muc"] for m in K23D.cac_muc(b, 1) if m["muc"] > a1 * 1.002][:1]   # 0.2% = dung sai mình đặt
+        dich = kc[0] if kc else None
+        return {"tf": tf, "loai": "C_ROI" if ic is not None else "B_CHAY",
+                "ngay_c": (datetime.fromtimestamp(b[ic][0] / 1000).strftime("%d/%m") if ic is not None else None),
+                "nen_b": het_b - idn, "rsi_dinh_a": round(max(x for x in r[iu:idn + 1] if x is not None), 1),
+                "rsi_min_b": round(min(r[idn:]), 1), "a0": a0, "a1": a1, "a_pct": round(A / a0 * 100),
+                "b_sau": round(sau), "bac": 1 if sau <= 50 else (2 if sau <= 61.8 else 3), "gia": gia,
+                "f05": f5, "f618": f618, "f70": f7, "dich": dich, "rr1": round((a1 - mid) / (mid - f7), 1),
+                "rr_dich": (round((dich - mid) / (mid - f7), 1) if dich else None)}
+    return None
+
+def _song2_doc(bb):
+    d = K23D.doc_khung([x[4] for x in bb]) if bb and len(bb) >= 60 else None
+    return d if (d and d.get("ema") is not None and d.get("wma") is not None) else None
+
+def song2_mot_coin(fetch, sym, itv4, itvd, itvw):
+    """Một coin: cú A ở 4H · 8H · 12H · 1D (8H/12H gộp từ 4H) → chỉ trả các khung còn sống (C rồi / B đang chạy)."""
+    b4a = fetch(sym, itv4, SONG2_SO_NEN)
+    bda = fetch(sym, itvd, SONG2_SO_NEN)
+    if not b4a or not bda or len(b4a) < 200:
+        return []
+    khung = {"4h": b4a[:-1], "8h": K23D.gop_nen(b4a, 2)[:-1], "12h": K23D.gop_nen(b4a, 3)[:-1], "1d": bda[:-1]}
+    kq = []
+    for tf, b in khung.items():
+        if len(b) < 120:
+            continue
+        x = _song2_mot_khung(b, tf)
+        if x and x["loai"] in ("C_ROI", "B_CHAY"):
+            kq.append(x)
+    if not kq:
+        return []
+    bwa = fetch(sym, itvw, 200) or []                 # tuần lấy THẲNG nến tuần của sàn, không gộp từ ngày
+    bang = {}
+    for t, bb in (("1d", bda[:-1]), ("2d", K23D.gop_nen(bda, 2)[:-1]), ("3d", K23D.gop_nen(bda, 3)[:-1]), ("1w", bwa[:-1])):
+        d = _song2_doc(bb)
+        if d:
+            bang[t] = d
+    out = []
+    for x in kq:
+        ks = [k for k in ("1d", "2d", "3d", "1w") if k in bang and not (x["tf"] == "1d" and k == "1d")]
+        h = ["▲" if bang[k]["ema"] > bang[k]["wma"] else "▼" for k in ks]
+        x["ct"] = ("THIẾU" if not h else "KỲ VỌNG+" if all(v == "▲" for v in h)
+                   else "KỲ VỌNG−" if all(v == "▼" for v in h) else "CẨN TRỌNG")
+        x["ct_txt"] = " ".join(f"{k.upper()}{v}" for k, v in zip(ks, h))
+        if x["ct"] != "KỲ VỌNG−":
+            out.append(x)
+    return out
+
+@st.cache_data(ttl=300)
+def scan_song2(rank_start=0, rank_end=500, scan_mexc=True, scan_gate=True, watchlist=()):
+    """LIỆT KÊ coin đang ở sóng B sau cú A quán tính (luật Kevin 11/10). Không chấm điểm — xếp theo C rồi → R:R."""
+    if K23D is None:
+        return [], f"Thiếu file k23 trong repo: {K23_LOI}"
+    results, any_pairs = [], False
+    wl = set(s.strip().upper().replace("_", "") for s in watchlist if s.strip())
+    tradfi = get_tradfi_symbols()
+    for bat, lay_pairs, lay_vol, fetch, itvs, ten, workers in (
+            (scan_mexc, get_mexc_usdt_pairs, get_mexc_volumes, _bars_mexc, ("4h", "1d", "1W"), "MEXC", WORKERS_MEXC),
+            (scan_gate, get_gate_usdt_pairs, get_gate_volumes, _bars_gate, ("4h", "1d", "7d"), "Gate", WORKERS_GATE)):
+        if not bat:
+            continue
+        pairs = lay_pairs()
+        if not pairs:
+            continue
+        any_pairs = True
+        pairs = [x for x in pairs if not any(s in x for s in SKIP_COINS) and not _is_leveraged(x) and x not in tradfi]
+        vols = lay_vol()
+        wl_p = [x for x in pairs if _wl_hit(x, wl)]
+        rest = [x for x in pairs if not _wl_hit(x, wl)]
+        if vols:
+            rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {ex.submit(song2_mot_coin, fetch, sym, *itvs): sym for sym in wl_p + rest[rank_start:rank_end]}
+            for fut in as_completed(fut_map):
+                sym = fut_map[fut]
+                try:
+                    rows = fut.result()
+                except Exception:
+                    continue
+                for x in rows:
+                    x["symbol"], x["exchange"], x["watched"] = sym, ten, _wl_hit(sym, wl)
+                    results.append(x)
+    if not any_pairs:
+        return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
+    results = _gop_san(results)
+    results.sort(key=lambda x: (not x["watched"], x["loai"] != "C_ROI", x["bac"],
+                                -(x["rr_dich"] if x["rr_dich"] is not None else x["rr1"])))
+    return results, None
 
 def analyze_narrative(gainers):
     nmap={"artificial-intelligence":"🤖 AI / Agent","ai":"🤖 AI / Agent","agent":"🤖 AI / Agent",
@@ -1196,32 +1400,119 @@ with tab4:
 
             st.markdown('<div class="warning">⚠️ RỦI RO: "râu quét rồi rút" ≠ "dump thật gãy range". Nếu coin GÃY range → limit trúng vào dao rơi. → Chỉ đặt trên coin ĐI NGANG xác nhận · <b>stagger</b> limit nhiều mức (nông→sâu) · <b>size NHỎ</b> mỗi mức · có <b>SL</b> cắt khi gãy range dứt khoát. KHÔNG "trung bình giá" khi gãy.</div>', unsafe_allow_html=True)
 
+def _fp(v):
+    if v is None: return "—"
+    return f"{v:.4g}" if v < 0.01 else f"{v:.6g}"
+
 with tab5:
+    # ── điều khiển DÙNG CHUNG cho hai khối ──
+    ce1, ce2, ce3 = st.columns([1, 1, 3])
+    with ce1:
+        tp_mexc = st.checkbox("MEXC", value=True, key="k23_mexc")
+    with ce2:
+        tp_gate = st.checkbox("Gate.io", value=True, key="k23_gate")
+    with ce3:
+        tp_wl_raw = st.text_input("📌 Token ưu tiên (luôn scan — cách nhau dấu phẩy)",
+                                  placeholder="VD: GRAMUSDT, UNI_USDT", key="k23_watchlist")
+    tp_watchlist = tuple(s.strip().upper() for s in tp_wl_raw.split(",") if s.strip())
+
+    # ════════════════ 🌊 SÓNG 2 — LỰC MUA TẠM NGHỈ (Kevin chốt 11/10) ════════════════
+    st.markdown("""
+    <div style="background:#161b22;border:1px solid #1f6feb;border-radius:10px;padding:14px 18px;margin:8px 0 16px;">
+        <div style="font-weight:600;color:#e6edf3;">🌊 Sóng 2 — cú A pump mạnh · B đi ngang lực mua tạm nghỉ · C vào ăn sóng 2</div>
+        <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
+            Cú A ở <b>4H · 8H · 12H · 1D</b> có quán tính (đỉnh RSI ≥ 80) · trong sóng B <b>RSI không thủng 50</b>, cả sau C ·
+            giá B hồi ≤ 0.5 bậc 1 · ≤ 0.618 bậc 2 · thủng 0.7 loại · khung trên (cụm 1D·2D·3D·1W phía trên khung cú A) không đồng thuận giảm.
+            <i>"Sóng điều chỉnh đi ngang là sự tạm nghỉ của lực mua, không có sự tham gia của lực bán"</i> (b2 2:32:34).
+            Trước C = 0 lệnh. Kiểu 1–2 lệnh/tháng.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    sa1, sa2 = st.columns([2, 3])
+    with sa1:
+        s2_bac = st.radio("Độ sâu sóng B", ["Bậc 1 (≤ 0.5)", "Bậc 1 + 2 (≤ 0.618)", "Mọi bậc còn sống"],
+                          index=0, horizontal=True, key="s2_bac",
+                          help="Bậc 1 = quán tính + hồi ≤ 50% → 'rất đẹp' (b8). 0.6–0.7 'đã rất yếu' (b10).")
+    with sa2:
+        s2_band = st.slider("Dải hạng volume", 0, 1500, (0, 500), 50, key="s2_band",
+                            help="Sóng 2 cần cả coin lớn (NEAR, SAND…) nên mặc định KHÔNG né top.")
+
+    sb1, sb2 = st.columns([1, 3])
+    with sb1:
+        s2_btn = st.button("🌊 Quét sóng 2", use_container_width=True, key="s2_scan_btn")
+    with sb2:
+        st.markdown('<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ 1000 nến 4H + 1000 nến ngày / con · ~2-4 phút · Cache 5 phút · Chỉ chạy khi bấm</div>', unsafe_allow_html=True)
+
+    if s2_btn and (tp_mexc or tp_gate):
+        scan_song2.clear()
+        with st.spinner(f"🌊 Đang dò cú A · 4H·8H·12H·1D · hạng {s2_band[0]}–{s2_band[1]}..."):
+            s_res, s_err = scan_song2(rank_start=s2_band[0], rank_end=s2_band[1],
+                                      scan_mexc=tp_mexc, scan_gate=tp_gate, watchlist=tp_watchlist)
+        st.session_state["s2_results"], st.session_state["s2_err"] = s_res, s_err
+        st.session_state["s2_loaded"] = True
+
+    if st.session_state.get("s2_loaded"):
+        s_res = st.session_state.get("s2_results", [])
+        s_err = st.session_state.get("s2_err")
+        bac_max = 1 if s2_bac.startswith("Bậc 1 (") else (2 if s2_bac.startswith("Bậc 1 +") else 3)
+        s_res = [r for r in s_res if r["bac"] <= bac_max]
+        if s_err:
+            st.error(f"Lỗi: {s_err}")
+        elif not s_res:
+            st.info("Không coin nào đạt luật sóng 2 ở bậc này. Nới bậc hoặc mở rộng dải hạng rồi quét lại.")
+        else:
+            n_c = sum(1 for r in s_res if r["loai"] == "C_ROI")
+            m1, m2 = st.columns(2)
+            m1.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#3fb950">{n_c}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">🟢 C RỒI — xuống khung nhỏ tìm entry</div></div>', unsafe_allow_html=True)
+            m2.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:#d29922">{len(s_res) - n_c}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">⏳ B ĐANG CHẠY — chờ C</div></div>', unsafe_allow_html=True)
+            st.markdown('<div style="color:#8b949e;font-size:0.82rem;margin:10px 0;">xếp: C rồi lên trước · trong nhóm theo R:R tới đích (vị thế, b32) — không chấm điểm</div>', unsafe_allow_html=True)
+            W2 = [0.8, 1.3, 0.6, 1.1, 0.9, 0.8, 1.4, 1.5, 1.6, 1.2]
+            for col, h in zip(st.columns(W2), ["Sàn", "Coin", "Khung", "Cú A", "B hồi", "RSI B thấp nhất",
+                                               "Trạng thái", "Vùng · SL 0.7", "TP1 → đích · R:R", "Khung trên"]):
+                col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
+            for it in s_res[:150]:
+                cols = st.columns(W2)
+                ex = it["exchange"] + (f" · {it['san_kia']}" if it.get("san_kia") else "")
+                cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {"badge-mexc" if it["exchange"] == "MEXC" else "badge-gate"}">{ex}</span></div>', unsafe_allow_html=True)
+                cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{"📌 " if it["watched"] else ""}{it["symbol"]}<br><span style="color:#8b949e;font-weight:400;font-size:0.8rem;">{_fp(it["gia"])}</span></div>', unsafe_allow_html=True)
+                cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;font-weight:600;">{it["tf"].upper()}</div>', unsafe_allow_html=True)
+                cols[3].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">+{it["a_pct"]}%<br><span style="color:#8b949e;">RSI đỉnh {it["rsi_dinh_a"]}</span></div>', unsafe_allow_html=True)
+                _mb = {1: "#3fb950", 2: "#d29922", 3: "#f85149"}[it["bac"]]
+                cols[4].markdown(f'<div style="padding-top:8px;font-size:0.8rem;color:{_mb};">{it["b_sau"]}%<br>bậc {it["bac"]}</div>', unsafe_allow_html=True)
+                cols[5].markdown(f'<div style="padding-top:8px;font-size:0.8rem;{"color:#d29922;" if it["rsi_min_b"] < 52 else ""}">{it["rsi_min_b"]}</div>', unsafe_allow_html=True)
+                _tt = (f'<span style="color:#3fb950;">🟢 C rồi {it["ngay_c"]}</span><br><span style="color:#8b949e;">vào ở khung nhỏ · cửa RSI</span>'
+                       if it["loai"] == "C_ROI" else
+                       f'<span style="color:#d29922;">⏳ B đang chạy</span><br><span style="color:#8b949e;">{it["nen_b"]} nến · chờ C</span>')
+                cols[6].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{_tt}</div>', unsafe_allow_html=True)
+                cols[7].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{_fp(it["f05"])} → {_fp(it["f618"])}<br><span style="color:#f85149;">SL {_fp(it["f70"])}</span></div>', unsafe_allow_html=True)
+                _dich = f'{_fp(it["dich"])} · R:R {it["rr_dich"]}' if it["dich"] is not None else f'chưa có KC trên · R:R {it["rr1"]}'
+                cols[8].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{_fp(it["a1"])} →<br>{_dich}</div>', unsafe_allow_html=True)
+                cols[9].markdown(f'<div style="padding-top:8px;font-size:0.75rem;color:{"#3fb950" if it["ct"] == "KỲ VỌNG+" else "#d29922"};">{it["ct"]}<br><span style="color:#8b949e;">{it["ct_txt"]}</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="warning">⚠️ Danh sách CANH, không phải lệnh. Trước C = 0 lệnh. C rồi: xuống khung nhỏ — cú A có quán tính nên cửa RSI là cửa chính (RSI khung cú A về dải EMA9–WMA45), giá về vùng 0.5–0.618 càng đẹp · SL dưới 0.7 · 1% tài khoản (phòng thủ 0.5%). Trước C mà RSI thủng 50 hoặc nến đóng dưới 0.7 = loại. RSI B thấp nhất màu vàng = sát mốc 50.</div>', unsafe_allow_html=True)
+
+    # ════════════════ 📐 MÔ HÌNH K23 — bảng cũ (cùng cổng cong_vao với bot RSI) ════════════════
+    st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("""
     <div style="background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px 18px;margin-bottom:16px;">
         <div style="font-weight:600;color:#e6edf3;">📐 Mô hình K23 — cùng cổng với bot RSI</div>
         <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
             Liệt kê coin <b>CÓ MÔ HÌNH</b> theo luật thầy Alden: vòng cung = đúng 2 lần EMA9 cắt WMA45, X ≥ 28 nến, Y ≥ 24 điểm RSI.
             Trạng thái lấy nguyên câu của bot: 🟢 trong vùng vào · ⏳ chờ về vùng 0.5–0.618 · 🔵 sóng mới (chưa có vùng) · ❌ hỏng.
-            MEXC + Gate · nến ĐÓNG · không chấm điểm · Cache 5 phút.
+            MEXC + Gate · nến ĐÓNG · bỏ cổ phiếu/ETF/vàng/bạc token hoá · một coin một dòng · không chấm điểm · Cache 5 phút.
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    ce1, ce2, ce3, ce4 = st.columns([1, 1, 1.3, 1.5])
-    with ce1:
-        tp_mexc = st.checkbox("MEXC", value=True, key="k23_mexc")
-    with ce2:
-        tp_gate = st.checkbox("Gate.io", value=True, key="k23_gate")
-    with ce3:
+    cf1, cf2, cf3 = st.columns([1.3, 1.5, 1.2])
+    with cf1:
         k23_khung = st.selectbox("Khung có mô hình", list(K23_KHUNG), index=3, key="k23_khung",
-            help="Khung đi săn mô hình. Vào lệnh ở khung nhỏ hơn (bóc dần, b27).")
-    with ce4:
+            help="Khung đi săn mô hình. Vào lệnh ở khung nhỏ hơn (bóc dần, b27). H8 · H12 gộp từ 4H.")
+    with cf2:
         k23_chieu = st.radio("Chiều", ["Cả hai", "∪ TĂNG", "∩ GIẢM"], index=0, horizontal=True, key="k23_chieu")
-
-    tp_wl_raw = st.text_input("📌 Token ưu tiên (luôn scan — cách nhau dấu phẩy)",
-                              placeholder="VD: GRAMUSDT, UNI_USDT", key="k23_watchlist")
-    tp_watchlist = tuple(s.strip().upper() for s in tp_wl_raw.split(",") if s.strip())
+    with cf3:
+        k23_hien_het = st.checkbox("Hiện cả 🔵 sóng mới · ❌ hỏng", value=False, key="k23_hien_het",
+                                   help="Mặc định chỉ hiện 🟢 trong vùng và ⏳ chờ vùng — số đếm ở trên vẫn tính đủ.")
     k23_band = st.slider("Dải hạng volume (né top)", 0, 1500, (100, 600), 50, key="k23_band",
                          help="Bỏ N coin top → quét dải lowcap (giống Câu Râu).")
 
@@ -1260,23 +1551,23 @@ with tab5:
                                                ("🔵", "SÓNG MỚI", "#58a6ff"), ("❌", "HỎNG", "#f85149")]):
                 col.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:{mau}">{dem[k]}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">{k} {ten}</div></div>', unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
+            k_hien = k_res if k23_hien_het else [r for r in k_res if r["ky"] in ("🟢", "⏳")]
             K23_HIEN = 150   # số dòng vẽ ra (Streamlit vẽ từng dòng chậm) — số MÌNH ĐẶT, không phải luật
             st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin-bottom:10px;">{len(k_res)} coin có mô hình'
-                        + (f' · hiện {K23_HIEN} dòng đầu' if len(k_res) > K23_HIEN else '')
+                        + ('' if k23_hien_het else f' · đang hiện {len(k_hien)} coin 🟢/⏳ (bật "Hiện cả 🔵 · ❌" để xem hết)')
+                        + (f' · hiện {K23_HIEN} dòng đầu' if len(k_hien) > K23_HIEN else '')
                         + ' · xếp theo trạng thái, trong nhóm cung đóng gần nhất lên trước</div>', unsafe_allow_html=True)
 
             hc = st.columns([0.9, 1.6, 1.1, 1.1, 1.2, 2.0, 3.4])
             for col, h in zip(hc, ["Sàn", "Symbol", "Giá", "Cung", "Đóng cách", "Vùng vào · SL 0.7", "Bot nói"]):
                 col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
 
-            def _fpk(v):
-                if v is None: return "—"
-                return f"{v:.4g}" if v < 0.01 else f"{v:.6g}"
+            _fpk = _fp
 
-            for it in k_res[:K23_HIEN]:
+            for it in k_hien[:K23_HIEN]:
                 cols = st.columns([0.9, 1.6, 1.1, 1.1, 1.2, 2.0, 3.4])
-                ex = it["exchange"]
-                cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {"badge-mexc" if ex == "MEXC" else "badge-gate"}">{ex}</span></div>', unsafe_allow_html=True)
+                ex = it["exchange"] + (f" · {it['san_kia']}" if it.get("san_kia") else "")
+                cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {"badge-mexc" if it["exchange"] == "MEXC" else "badge-gate"}">{ex}</span></div>', unsafe_allow_html=True)
                 cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{"📌 " if it["watched"] else ""}{it["symbol"]}</div>', unsafe_allow_html=True)
                 cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{_fpk(it["current_price"])}</div>', unsafe_allow_html=True)
                 _ch = '<span style="color:#3fb950;">∪ TĂNG</span>' if it["chieu"] == 1 else '<span style="color:#f85149;">∩ GIẢM</span>'
