@@ -948,6 +948,122 @@ def scan_song2(rank_start=0, rank_end=500, scan_mexc=True, scan_gate=True, watch
                                 -(x["rr_dich"] if x["rr_dich"] is not None else x["rr1"])))
     return results, None
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ⚠️ TÍN HIỆU SỚM Ở ĐỈNH — KC TEST FAIL (Kevin CODE ĐI 12/10 · memory tin-hieu-som-tai-dinh) · CHỈ BÀY, không cổng
+# ═══════════════════════════════════════════════════════════════════════════════
+# Kevin 12/10: "tín hiệu sớm khung h1 và h4 đã giảm… cứ chờ rsi rớt mới chịu thì giá đã nát bét".
+#   mỗi lần test = ĐỈNH MỘT CON SÓNG TĂNG (đoạn EMA9 > WMA45) lấy từ day_dinh_song — râu không phải đỉnh (b26 0:10:52)
+#   FAIL quán tính = lần đầu RSI ≥ 80, các lần test sau không lên lại 80, "RSI nó chớm vùng 70 thôi" (b4 0:44:30 · 0:46:04)
+#        = chế độ ① của fail_quan_tinh · chưa có quán tính thì không có gì để fail (b23 0:23:33)
+#        sóng test cuối còn chạy mà RSI chưa quay đầu ≥ 5 điểm → CHƯA kết luận (y điều kiện da_quay của fail_quan_tinh)
+#   đỉnh thấp dần = mô hình suy yếu / cụm đỉnh / khu vực phân phối (b27 0:41:19 · b15 1:15:46 · 1:16:02)
+#   khung nhỏ sóng giảm = EMA9 < WMA45 + cấu trúc giảm còn giữ (b20 1:11:13 · cau_truc_gia)
+#   test nhiều lần không phá thì vùng đó có giá trị (b37) — đọc KÈM RSI từng lần: RSI yếu dần → giữ; RSI vẫn mạnh → mòn (note 54)
+# SỐ MÌNH ĐẶT: sóng sau hồi ≥ 80% đoạn rơi từ đỉnh mới gọi là "test lại" · chỉ xét sóng trong 150 nến gần nhất.
+DF_TEST_HOI = 0.80
+DF_NHIN = 150
+DF_KHUNG = {"H4": (("4h", "4h"), ("60m", "1h"), "H1"), "D": (("1d", "1d"), ("4h", "4h"), "H4")}
+
+def _df_song_tang(b):
+    """Các con sóng TĂNG trong b (nến đã đóng): [(i0, i1, i_dinh, gia_dinh, rsi_dinh)] + mảng RSI."""
+    r = K23D.rsi([x[4] for x in b], 14); f = K23D._ema(r, 9); s = K23D._wma(r, 45)
+    ra = []
+    for i0, i1, _ in K23.day_dinh_song(b, -1):
+        giua = (i0 + i1) // 2
+        if f[giua] is None or s[giua] is None or f[giua] <= s[giua]:
+            continue
+        i_d = max(range(i0, i1 + 1), key=lambda j: b[j][2])
+        rr = [x for x in r[i0:i1 + 1] if x is not None]
+        ra.append((i0, i1, i_d, b[i_d][2], round(max(rr), 1) if rr else None))
+    return ra, r
+
+def dinh_fail_mot(b, b_nho):
+    """b = khung đọc đỉnh, b_nho = khung nhỏ hơn (đều đã bỏ nến đang chạy). Trả dict hoặc None."""
+    ups, r = _df_song_tang(b)
+    n = len(b)
+    ups = [u for u in ups if u[2] >= n - DF_NHIN]
+    if len(ups) < 2:
+        return None
+    k0 = max(range(len(ups)), key=lambda k: ups[k][3])          # đỉnh cao nhất vùng xét = KC
+    T0 = ups[k0]
+    tests = [T0]
+    for u in ups[k0 + 1:]:
+        day_giua = min(x[3] for x in b[tests[-1][2]:u[2] + 1])
+        roi = T0[3] - day_giua
+        if roi > 0 and (u[3] - day_giua) / roi >= DF_TEST_HOI and u[3] <= T0[3]:
+            tests.append(u)
+    gia = b[-1][4]
+    if len(tests) < 2 or gia > T0[3]:
+        return None
+    rsi_ds = [t[4] for t in tests]
+    cuoi = tests[-1]
+    dang_test = cuoi[1] >= n - 1 and r[-1] is not None and cuoi[4] is not None and r[-1] > cuoi[4] - 5
+    co_qt = rsi_ds[0] is not None and rsi_ds[0] >= K23.QT_T
+    fail = (not dang_test and co_qt and all(x is not None and x < K23.QT_T for x in rsi_ds[1:]))
+    thap_dan = all(tests[k][3] <= tests[k - 1][3] for k in range(1, len(tests)))
+    rn = K23D.rsi([x[4] for x in b_nho], 14); fn = K23D._ema(rn, 9); sn = K23D._wma(rn, 45)
+    nho_giam = (fn[-1] is not None and sn[-1] is not None and fn[-1] < sn[-1]) and bool(K23.cau_truc_gia(b_nho, -1)[0])
+    t_T0 = b[T0[2]][0]
+    ups_n, _ = _df_song_tang(b_nho)
+    day_tu = min((x[3] for x in b_nho if x[0] >= t_T0), default=None)
+    test_nho = 0
+    if day_tu is not None and T0[3] > day_tu and b_nho and b_nho[0][0] <= t_T0:
+        test_nho = sum(1 for u in ups_n if b_nho[u[2]][0] >= t_T0
+                       and (u[3] - day_tu) / (T0[3] - day_tu) >= DF_TEST_HOI and u[3] <= T0[3] * 1.003)
+    return {"kc": T0[3], "so_test": len(tests), "test_nho": test_nho or None, "gia_test": [t[3] for t in tests],
+            "rsi_test": rsi_ds, "co_qt": co_qt, "dang_test": dang_test, "fail": fail, "thap_dan": thap_dan,
+            "nho_giam": nho_giam, "rsi_nho": (round(rn[-1], 1) if rn[-1] is not None else None),
+            "gia": gia, "cach": round((gia / T0[3] - 1) * 100, 1), "nen_tu_test": n - 1 - cuoi[2]}
+
+def _df_mot_coin(fetch, sym, itv, itv_nho):
+    b = fetch(sym, itv, 400)
+    bn = fetch(sym, itv_nho, 1000)                    # khung nhỏ phải phủ được tới lúc có đỉnh KC
+    if not b or not bn or len(b) < 120 or len(bn) < 120:
+        return None
+    return dinh_fail_mot(b[:-1], bn[:-1])
+
+@st.cache_data(ttl=300)
+def scan_dinh_fail(rank_start=0, rank_end=500, khung="H4", scan_mexc=True, scan_gate=True, watchlist=()):
+    """LIỆT KÊ coin có đỉnh bị test ≥ 2 lần mà chưa phá — kèm RSI từng lần, FAIL quán tính, khung nhỏ. Không chấm điểm."""
+    if K23 is None or K23D is None:
+        return [], f"Thiếu file k23 trong repo: {K23_LOI}"
+    (itv_m, itv_g), (itvn_m, itvn_g), _ = DF_KHUNG[khung]
+    results, any_pairs = [], False
+    wl = set(s.strip().upper().replace("_", "") for s in watchlist if s.strip())
+    tradfi = get_tradfi_symbols()
+    for bat, lay_pairs, lay_vol, fetch, iv, ivn, ten, workers in (
+            (scan_mexc, get_mexc_usdt_pairs, get_mexc_volumes, _bars_mexc, itv_m, itvn_m, "MEXC", WORKERS_MEXC),
+            (scan_gate, get_gate_usdt_pairs, get_gate_volumes, _bars_gate, itv_g, itvn_g, "Gate", WORKERS_GATE)):
+        if not bat:
+            continue
+        pairs = lay_pairs()
+        if not pairs:
+            continue
+        any_pairs = True
+        pairs = [x for x in pairs if not any(s in x for s in SKIP_COINS) and not _is_leveraged(x) and x not in tradfi]
+        vols = lay_vol()
+        wl_p = [x for x in pairs if _wl_hit(x, wl)]
+        rest = [x for x in pairs if not _wl_hit(x, wl)]
+        if vols:
+            rest.sort(key=lambda s: vols.get(s, 0.0), reverse=True)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {ex.submit(_df_mot_coin, fetch, sym, iv, ivn): sym for sym in wl_p + rest[rank_start:rank_end]}
+            for fut in as_completed(fut_map):
+                sym = fut_map[fut]
+                try:
+                    x = fut.result()
+                except Exception:
+                    continue
+                if x:
+                    x["symbol"], x["exchange"], x["watched"] = sym, ten, _wl_hit(sym, wl)
+                    results.append(x)
+    if not any_pairs:
+        return [], "Không lấy được danh sách pairs từ sàn nào (kiểm tra mạng/API)."
+    results = _gop_san(results)
+    # xếp theo TRẠNG THÁI: FAIL + khung nhỏ đã giảm → FAIL → đỉnh thấp dần → còn lại; trong nhóm: lần test gần nhất lên trước
+    results.sort(key=lambda x: (not x["watched"], not (x["fail"] and x["nho_giam"]), not x["fail"], not x["thap_dan"], x["nen_tu_test"]))
+    return results, None
+
 def analyze_narrative(gainers):
     nmap={"artificial-intelligence":"🤖 AI / Agent","ai":"🤖 AI / Agent","agent":"🤖 AI / Agent",
           "real-world-assets":"🏦 RWA","rwa":"🏦 RWA",
@@ -1490,6 +1606,86 @@ with tab5:
                 cols[8].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{_fp(it["a1"])} →<br>{_dich}</div>', unsafe_allow_html=True)
                 cols[9].markdown(f'<div style="padding-top:8px;font-size:0.75rem;color:{"#3fb950" if it["ct"] == "KỲ VỌNG+" else "#d29922"};">{it["ct"]}<br><span style="color:#8b949e;">{it["ct_txt"]}</span></div>', unsafe_allow_html=True)
             st.markdown('<div class="warning">⚠️ Danh sách CANH, không phải lệnh. Trước C = 0 lệnh. C rồi: xuống khung nhỏ — cú A có quán tính nên cửa RSI là cửa chính (RSI khung cú A về dải EMA9–WMA45), giá về vùng 0.5–0.618 càng đẹp · SL dưới 0.7 · 1% tài khoản (phòng thủ 0.5%). Trước C mà RSI thủng 50 hoặc nến đóng dưới 0.7 = loại. RSI B thấp nhất màu vàng = sát mốc 50.</div>', unsafe_allow_html=True)
+
+    # ════════════════ ⚠️ TÍN HIỆU SỚM Ở ĐỈNH — KC TEST FAIL (Kevin CODE ĐI 12/10) ════════════════
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style="background:#161b22;border:1px solid #f85149;border-radius:10px;padding:14px 18px;margin:8px 0 16px;">
+        <div style="font-weight:600;color:#e6edf3;">⚠️ Tín hiệu sớm ở đỉnh — kháng cự bị test nhiều lần mà không phá</div>
+        <div style="color:#8b949e;font-size:0.82rem;margin-top:4px;">
+            Đọc <b>TẠI đỉnh</b>, không chờ RSI rớt: mỗi lần test = đỉnh một con sóng tăng · lần đầu RSI ≥ 80 mà các lần sau
+            <i>"chớm vùng 70 thôi"</i> = <b>FAIL quán tính</b> (b4 0:46:04) · đỉnh thấp dần = mô hình suy yếu (b15 1:16:02) ·
+            khung nhỏ đã sóng giảm = khung nhỏ kéo khung lớn vào chỉnh (b20 1:11:13).
+            → <b>thoát long · không mua mới · canh bán khi khung nhỏ có ∩ đóng C</b>. Chỉ bày, không phải lệnh.
+            Số mình đặt: hồi ≥ 80% đoạn rơi mới gọi là test lại · xét 150 nến gần nhất.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    da1, da2 = st.columns([1, 3])
+    with da1:
+        df_khung = st.radio("Khung đọc đỉnh", list(DF_KHUNG), index=0, horizontal=True, key="df_khung",
+                            help="H4: đỉnh trên 4H, khung nhỏ H1 · D: đỉnh trên ngày, khung nhỏ H4")
+    with da2:
+        df_band = st.slider("Dải hạng volume", 0, 1500, (0, 500), 50, key="df_band")
+    db1, db2 = st.columns([1, 3])
+    with db1:
+        df_btn = st.button("⚠️ Quét đỉnh", use_container_width=True, key="df_scan_btn")
+    with db2:
+        st.markdown('<div style="color:#8b949e;font-size:0.82rem;padding-top:10px;">⏱ 400 nến khung đỉnh + 1000 nến khung nhỏ / con · ~2-4 phút · Cache 5 phút · Chỉ chạy khi bấm</div>', unsafe_allow_html=True)
+
+    if df_btn and (tp_mexc or tp_gate):
+        scan_dinh_fail.clear()
+        with st.spinner(f"⚠️ Đang dò đỉnh bị test · {df_khung} · hạng {df_band[0]}–{df_band[1]}..."):
+            d_res, d_err = scan_dinh_fail(rank_start=df_band[0], rank_end=df_band[1], khung=df_khung,
+                                          scan_mexc=tp_mexc, scan_gate=tp_gate, watchlist=tp_watchlist)
+        st.session_state["df_results"], st.session_state["df_err"] = d_res, d_err
+        st.session_state["df_loaded"] = True
+        st.session_state["df_khung_da_quet"] = df_khung
+
+    if st.session_state.get("df_loaded"):
+        d_res = st.session_state.get("df_results", [])
+        d_err = st.session_state.get("df_err")
+        k_nho = DF_KHUNG[st.session_state.get("df_khung_da_quet", "H4")][2]
+        if d_err:
+            st.error(f"Lỗi: {d_err}")
+        elif not d_res:
+            st.info("Không coin nào có đỉnh bị test ≥ 2 lần mà chưa phá ở khung này.")
+        else:
+            n_f = sum(1 for r in d_res if r["fail"])
+            n_fg = sum(1 for r in d_res if r["fail"] and r["nho_giam"])
+            n_t = sum(1 for r in d_res if r["dang_test"])
+            mm = st.columns(3)
+            for col, (so, ten, mau) in zip(mm, [(n_fg, f"🔴 FAIL + {k_nho} ĐÃ SÓNG GIẢM", "#f85149"), (n_f, "🟠 FAIL QUÁN TÍNH", "#d29922"),
+                                                (n_t, "⏳ ĐANG TEST — chưa kết luận", "#58a6ff")]):
+                col.markdown(f'<div class="card"><div style="font-size:2rem;font-weight:700;color:{mau}">{so}</div><div style="color:#8b949e;font-size:0.75rem;margin-top:4px;">{ten}</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="color:#8b949e;font-size:0.82rem;margin:10px 0;">{len(d_res)} coin có đỉnh bị test ≥ 2 lần chưa phá · xếp: FAIL + khung nhỏ giảm → FAIL → đỉnh thấp dần → còn lại · trong nhóm lần test gần nhất lên trước — không chấm điểm</div>', unsafe_allow_html=True)
+            W3 = [0.8, 1.3, 1.1, 1.0, 2.0, 1.4, 0.9, 1.1, 0.9]
+            for col, h in zip(st.columns(W3), ["Sàn", "Coin", "Đỉnh (KC)", "Số lần test", "Đỉnh · RSI từng lần",
+                                               "Quán tính", "Đỉnh thấp dần", f"{k_nho} sóng giảm", "Cách đỉnh"]):
+                col.markdown(f'<div style="color:#8b949e;font-size:0.72rem;text-transform:uppercase;padding-bottom:8px;">{h}</div>', unsafe_allow_html=True)
+            for it in d_res[:150]:
+                cols = st.columns(W3)
+                ex = it["exchange"] + (f" · {it['san_kia']}" if it.get("san_kia") else "")
+                cols[0].markdown(f'<div style="padding-top:8px;"><span class="badge {"badge-mexc" if it["exchange"] == "MEXC" else "badge-gate"}">{ex}</span></div>', unsafe_allow_html=True)
+                cols[1].markdown(f'<div style="padding-top:8px;font-weight:600;color:#58a6ff;">{"📌 " if it["watched"] else ""}{it["symbol"]}<br><span style="color:#8b949e;font-weight:400;font-size:0.8rem;">{_fp(it["gia"])}</span></div>', unsafe_allow_html=True)
+                cols[2].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{_fp(it["kc"])}</div>', unsafe_allow_html=True)
+                _nho = f'<br><span style="color:#8b949e;">{k_nho}: {it["test_nho"]} lần</span>' if it["test_nho"] else ""
+                cols[3].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{it["so_test"]} lần{_nho}<br><span style="color:#8b949e;">gần nhất {it["nen_tu_test"]} nến trước</span></div>', unsafe_allow_html=True)
+                _ds = " → ".join(f'{_fp(g)} <span style="color:{"#3fb950" if (r_ or 0) >= 80 else "#d29922"};">({r_})</span>' for g, r_ in zip(it["gia_test"], it["rsi_test"]))
+                cols[4].markdown(f'<div style="padding-top:8px;font-size:0.78rem;">{_ds}</div>', unsafe_allow_html=True)
+                if it["dang_test"]:
+                    _qt = '<span style="color:#58a6ff;">⏳ đang test</span><br><span style="color:#8b949e;">RSI chưa quay đầu</span>'
+                elif it["fail"]:
+                    _qt = '<span style="color:#f85149;">🔴 FAIL</span><br><span style="color:#8b949e;">không lên lại 80</span>'
+                elif not it["co_qt"]:
+                    _qt = '<span style="color:#8b949e;">lần đầu chưa tới 80</span><br><span style="color:#8b949e;">không có gì để fail</span>'
+                else:
+                    _qt = '<span style="color:#3fb950;">còn quán tính</span>'
+                cols[5].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{_qt}</div>', unsafe_allow_html=True)
+                cols[6].markdown(f'<div style="padding-top:8px;font-size:0.85rem;">{"✅" if it["thap_dan"] else "—"}</div>', unsafe_allow_html=True)
+                cols[7].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{"✅" if it["nho_giam"] else "—"}<br><span style="color:#8b949e;">RSI {it["rsi_nho"]}</span></div>', unsafe_allow_html=True)
+                cols[8].markdown(f'<div style="padding-top:8px;font-size:0.8rem;">{it["cach"]}%</div>', unsafe_allow_html=True)
+            st.markdown('<div class="warning">⚠️ Chỉ bày, không phải lệnh. 🔴 FAIL ở đỉnh = thoát long và không mua mới tại đó. Muốn BÁN vẫn phải có mô hình ∩ ở khung nhỏ đóng C (quy luật 1) · SL trên đỉnh KC · 0.5–1% tài khoản. RSI các lần test vẫn ≥ 80 (còn quán tính) thì đỉnh có thể bị phá — đừng bán ngược quán tính (né 4, b13).</div>', unsafe_allow_html=True)
 
     # ════════════════ 📐 MÔ HÌNH K23 — bảng cũ (cùng cổng cong_vao với bot RSI) ════════════════
     st.markdown("<br>", unsafe_allow_html=True)
